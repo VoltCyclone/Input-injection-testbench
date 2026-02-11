@@ -442,8 +442,8 @@ static gboolean on_sidebar_draw(GtkWidget* widget, cairo_t* cr, gpointer data) {
 
         SB_HEADER("HUMANIZATION");
         double hr, hg, hb;
-        if (a->h_score < 25) { hr=240/255.0; hg=64/255.0; hb=96/255.0; }
-        else if (a->h_score < 50) { hr=232/255.0; hg=200/255.0; hb=64/255.0; }
+        if (a->h_score < 35) { hr=240/255.0; hg=64/255.0; hb=96/255.0; }
+        else if (a->h_score < 55) { hr=232/255.0; hg=200/255.0; hb=64/255.0; }
         else { hr=64/255.0; hg=216/255.0; hb=128/255.0; }
         cairo_set_source_rgb(cr, hr, hg, hb);
         cairo_set_font_size(cr, 22);

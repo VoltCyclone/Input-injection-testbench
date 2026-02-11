@@ -276,19 +276,43 @@ void trace_analyze(void) {
         a->cmd_hist[b]++;
     }
 
-    /* Humanization score */
-    double h = 0;
-    if (a->perp_scatter > 0.05)  h += fmin(a->perp_scatter / 0.5, 1.0) * 25;
-    if (a->jit_avg >= 0.1)       h += fmin(a->jit_avg / 0.6, 1.0) * 20;
-    if (a->dir_flip_rate > 2)    h += fmin(a->dir_flip_rate / 15.0, 1.0) * 15;
-    if (a->speed_cv > 0.05)      h += fmin(a->speed_cv / 0.25, 1.0) * 15;
-    if (a->sub_px_pct > 1)       h += fmin(a->sub_px_pct / 8.0, 1.0) * 10;
-    if (a->accel_jerk > 0.001)   h += fmin(a->accel_jerk / 0.05, 1.0) * 10;
-    if (a->path_eff < 0.995)     h += fmin((1.0 - a->path_eff) / 0.05, 1.0) * 5;
+    /* ── Humanization Score ──────────────────────────────────────────
+     * Bell-curve model: each metric is scored by how close it falls to
+     * the empirical "human" range. Too-perfect (robotic) AND too-noisy
+     * (synthetic jitter) both reduce the score.
+     *
+     * Reference ranges from recorded human mouse data:
+     *   Perp scatter:  0.08–0.60 px  (ideal ~0.25)
+     *   Jitter avg:    0.005–0.08 px (ideal ~0.03)
+     *   Speed CV:      0.15–0.80     (ideal ~0.40)
+     *   Dir flip rate: 3–20%         (ideal ~10%)
+     *   Sub-pixel:     2–15%         (ideal ~6%)
+     *   Interval CV:   0.05–0.40     (ideal ~0.20)
+     *   Path eff:      0.85–0.995    (ideal ~0.96)
+     */
+
+    /* Gaussian-ish bell: score = exp(-0.5 * ((log(x/center)/width)^2))
+     * Returns 0–1, peaks at center, symmetric on log scale */
+    #define BELL(val, center, width) \
+        (((val) > 1e-9) ? exp(-0.5 * pow(log((val)/(center)) / (width), 2)) : 0.0)
+
+    double ps  = BELL(a->perp_scatter,  0.25,  1.0);  /* 25pts */
+    double jt  = BELL(a->jit_avg,       0.03,  0.9);  /* 20pts */
+    double scv = BELL(a->speed_cv,      0.40,  0.8);  /* 20pts */
+    double dfr = BELL(a->dir_flip_rate, 10.0,  0.8);  /* 10pts */
+    double spx = BELL(a->sub_px_pct,    6.0,   0.8);  /* 5pts  */
+    double icv = BELL(a->int_cv,        0.20,  0.8);  /* 10pts */
+    double pef = (a->path_eff > 0.001 && a->path_eff < 1.0)
+               ? BELL(1.0 - a->path_eff, 0.04, 0.8) : 0.0; /* 10pts */
+
+    #undef BELL
+
+    double h = ps * 25.0 + jt * 20.0 + scv * 20.0 + dfr * 10.0
+             + spx * 5.0 + icv * 10.0 + pef * 10.0;
     if (h > 100) h = 100;
     a->h_score = h;
-    a->h_grade = (h < 10) ? "Robotic" : (h < 25) ? "Minimal" :
-                 (h < 50) ? "Moderate" : (h < 75) ? "Good" : "Excellent";
+    a->h_grade = (h < 15) ? "Robotic" : (h < 35) ? "Synthetic" :
+                 (h < 55) ? "Plausible" : (h < 75) ? "Convincing" : "Human";
 
     g_trace.analysis_valid = true;
 }
@@ -591,11 +615,17 @@ void cli_print_results(const char* test_name) {
     printf("Commands:     %u\n", g_trace.cmd_count);
     printf("Observations: %u\n", g_trace.obs_count);
     printf("Duration:     %.1f ms\n", a->total_ms);
-    printf("Avg gap:      %.2f px\n", a->dev_avg);
-    printf("Humanization: %d/100 (%s)\n", (int)a->h_score, a->h_grade);
-    printf("Perp scatter: %.3f px\n", a->perp_scatter);
-    printf("Jitter avg:   %.3f px\n", a->jit_avg);
-    printf("Speed CV:     %.3f\n", a->speed_cv);
+    printf("Cmd rate:     %.0f Hz   Obs rate: %.0f Hz\n", a->cmd_rate, a->obs_rate);
+    printf("Avg gap:      %.2f px   Max gap: %.2f px\n", a->dev_avg, a->dev_max);
+    printf("\n-- Humanization: %d/100 (%s) --\n", (int)a->h_score, a->h_grade);
+    printf("  Perp scatter: %.3f px  (ideal ~0.25, range 0.08-0.60)\n", a->perp_scatter);
+    printf("  Jitter avg:   %.3f px  (ideal ~0.03, range 0.005-0.08)\n", a->jit_avg);
+    printf("  Speed CV:     %.3f     (ideal ~0.40, range 0.15-0.80)\n", a->speed_cv);
+    printf("  Dir flips:    %.1f%%    (ideal ~10%%, range 3-20%%)\n", a->dir_flip_rate);
+    printf("  Sub-pixel:    %.1f%%    (ideal ~6%%, range 2-15%%)\n", a->sub_px_pct);
+    printf("  Interval CV:  %.3f     (ideal ~0.20, range 0.05-0.40)\n", a->int_cv);
+    printf("  Path eff:     %.4f    (ideal ~0.96, range 0.85-0.995)\n", a->path_eff);
+    printf("  Accel jerk:   %.4f\n", a->accel_jerk);
     printf("Sent/OK/ERR:  %lld/%lld/%lld\n",
            (long long)g_stat_sent, (long long)g_stat_ok, (long long)g_stat_err);
 }

@@ -36,7 +36,8 @@ ifeq ($(PLATFORM),Darwin)
   CC       ?= clang
   OBJCFLAGS = $(CFLAGS) -fobjc-arc
   FRAMEWORKS = -framework Cocoa -framework CoreGraphics \
-               -framework ApplicationServices -framework QuartzCore
+               -framework ApplicationServices -framework QuartzCore \
+               -framework IOKit
   SRCS     = app.m protocols.c
   OBJS     = app.o protocols.o
   LINK     = $(CC) $(OBJCFLAGS) -o $(TARGET) $(OBJS) $(FRAMEWORKS) $(LIBS)

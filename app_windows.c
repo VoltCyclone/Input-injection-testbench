@@ -489,7 +489,7 @@ static void paint_sidebar(HWND hwnd) {
         y += 6;
 
         HEADER("HUMANIZATION");
-        COLORREF hCol = (a->h_score < 25) ? RGB_RED : (a->h_score < 50) ? RGB_YELLOW : RGB_GREEN;
+        COLORREF hCol = (a->h_score < 35) ? RGB_RED : (a->h_score < 55) ? RGB_YELLOW : RGB_GREEN;
         snprintf(buf, sizeof(buf), "%d/100 (%s)", (int)a->h_score, a->h_grade);
         SetTextColor(hdc, hCol);
         SelectObject(hdc, g_font_big);

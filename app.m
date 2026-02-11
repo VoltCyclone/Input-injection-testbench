@@ -33,6 +33,8 @@
 #include <pthread.h>
 #include <termios.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
+#include <IOKit/serial/ioss.h>
 #include <signal.h>
 #include <math.h>
 #include "protocols.h"
@@ -405,19 +407,42 @@ static void trace_analyze(void) {
         a->cmd_hist[b]++;
     }
 
-    // Humanization score
-    double h = 0;
-    if (a->perp_scatter > 0.05)  h += fmin(a->perp_scatter / 0.5, 1.0) * 25;
-    if (a->jit_avg >= 0.1)       h += fmin(a->jit_avg / 0.6, 1.0) * 20;
-    if (a->dir_flip_rate > 2)    h += fmin(a->dir_flip_rate / 15.0, 1.0) * 15;
-    if (a->speed_cv > 0.05)      h += fmin(a->speed_cv / 0.25, 1.0) * 15;
-    if (a->sub_px_pct > 1)       h += fmin(a->sub_px_pct / 8.0, 1.0) * 10;
-    if (a->accel_jerk > 0.001)   h += fmin(a->accel_jerk / 0.05, 1.0) * 10;
-    if (a->path_eff < 0.995)     h += fmin((1.0 - a->path_eff) / 0.05, 1.0) * 5;
+    // ── Humanization Score ──────────────────────────────────────────
+    // Bell-curve model: each metric is scored by how close it falls to
+    // the empirical "human" range. Too-perfect (robotic) AND too-noisy
+    // (synthetic jitter) both reduce the score.
+    //
+    // Reference ranges from recorded human mouse data:
+    //   Perp scatter:  0.08–0.60 px  (ideal ~0.25)
+    //   Jitter avg:    0.005–0.08 px (ideal ~0.03)
+    //   Speed CV:      0.15–0.80     (ideal ~0.40)
+    //   Dir flip rate: 3–20%         (ideal ~10%)
+    //   Sub-pixel:     2–15%         (ideal ~6%)
+    //   Interval CV:   0.05–0.40     (ideal ~0.20)
+    //   Path eff:      0.85–0.995    (ideal ~0.96)
+
+    // Gaussian-ish bell: score = exp(-0.5 * ((log(x/center)/width)^2))
+    // Returns 0–1, peaks at center, symmetric on log scale
+    #define BELL(val, center, width) \
+        (((val) > 1e-9) ? exp(-0.5 * pow(log((val)/(center)) / (width), 2)) : 0.0)
+
+    double ps  = BELL(a->perp_scatter,  0.25,  1.0);  // 25pts
+    double jt  = BELL(a->jit_avg,       0.03,  0.9);  // 20pts
+    double scv = BELL(a->speed_cv,      0.40,  0.8);  // 20pts
+    double dfr = BELL(a->dir_flip_rate, 10.0,  0.8);  // 10pts
+    double spx = BELL(a->sub_px_pct,    6.0,   0.8);  // 5pts
+    double icv = BELL(a->int_cv,        0.20,  0.8);  // 10pts
+    double pef = (a->path_eff > 0.001 && a->path_eff < 1.0)
+               ? BELL(1.0 - a->path_eff, 0.04, 0.8) : 0.0; // 10pts
+
+    #undef BELL
+
+    double h = ps * 25.0 + jt * 20.0 + scv * 20.0 + dfr * 10.0
+             + spx * 5.0 + icv * 10.0 + pef * 10.0;
     if (h > 100) h = 100;
     a->h_score = h;
-    a->h_grade = (h < 10) ? "Robotic" : (h < 25) ? "Minimal" :
-                 (h < 50) ? "Moderate" : (h < 75) ? "Good" : "Excellent";
+    a->h_grade = (h < 15) ? "Robotic" : (h < 35) ? "Synthetic" :
+                 (h < 55) ? "Plausible" : (h < 75) ? "Convincing" : "Human";
 
     g_trace.analysis_valid = true;
 }
@@ -437,24 +462,43 @@ static int serial_open(const char* port, int baud) {
     struct termios tty;
     if (tcgetattr(fd, &tty) != 0) { close(fd); return -1; }
 
-    speed_t speed;
+    // Configure termios with a placeholder baud — the real rate is set
+    // via IOSSIOSPEED below for non-standard rates (e.g. 2M baud).
+    speed_t posix_speed;
+    bool need_iossiospeed = false;
     switch (baud) {
-        case 9600:   speed = B9600; break;
-        case 19200:  speed = B19200; break;
-        case 38400:  speed = B38400; break;
-        case 57600:  speed = B57600; break;
-        case 115200: speed = B115200; break;
-        case 230400: speed = B230400; break;
-        default:     speed = B115200; break;
+        case 9600:   posix_speed = B9600;   break;
+        case 19200:  posix_speed = B19200;  break;
+        case 38400:  posix_speed = B38400;  break;
+        case 57600:  posix_speed = B57600;  break;
+        case 115200: posix_speed = B115200; break;
+        case 230400: posix_speed = B230400; break;
+        default:
+            // macOS doesn't define B460800+ — use IOSSIOSPEED ioctl.
+            posix_speed = B230400;  // Placeholder for termios setup
+            need_iossiospeed = true;
+            break;
     }
-    cfsetospeed(&tty, speed);
-    cfsetispeed(&tty, speed);
+    cfsetospeed(&tty, posix_speed);
+    cfsetispeed(&tty, posix_speed);
     tty.c_cflag = (tty.c_cflag & ~(PARENB|CSTOPB|CSIZE|CRTSCTS)) | CS8 | CREAD | CLOCAL;
     tty.c_lflag &= ~(ICANON|ECHO|ECHOE|ECHONL|ISIG);
     tty.c_iflag &= ~(IXON|IXOFF|IXANY|IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL);
     tty.c_oflag &= ~(OPOST|ONLCR);
     tty.c_cc[VTIME] = 1; tty.c_cc[VMIN] = 0;
     if (tcsetattr(fd, TCSANOW, &tty) != 0) { close(fd); return -1; }
+
+    // For non-standard baud rates (>230400), use the macOS IOKit ioctl.
+    // IOSSIOSPEED accepts any arbitrary integer baud rate and programs
+    // the UART directly — this is the only way to reach 2M baud on macOS.
+    if (need_iossiospeed) {
+        speed_t custom_speed = (speed_t)baud;
+        if (ioctl(fd, IOSSIOSPEED, &custom_speed) == -1) {
+            close(fd);
+            return -1;
+        }
+    }
+
     tcflush(fd, TCIOFLUSH);
     return fd;
 }
@@ -1372,9 +1416,9 @@ static void test_diag_ease(void) {
 
         // Humanization score
         addHeader(@"Humanization Analysis");
-        NSColor* hCol = (a->h_score < 25) ? col_red : (a->h_score < 50) ? col_yellow : col_green;
-        NSColor* hBg = (a->h_score < 10) ? CLR(58,21,21,1) : (a->h_score < 25) ? CLR(58,42,21,1) :
-                       (a->h_score < 50) ? CLR(42,58,21,1) : CLR(21,58,26,1);
+        NSColor* hCol = (a->h_score < 35) ? col_red : (a->h_score < 55) ? col_yellow : col_green;
+        NSColor* hBg = (a->h_score < 15) ? CLR(58,21,21,1) : (a->h_score < 35) ? CLR(58,42,21,1) :
+                       (a->h_score < 55) ? CLR(42,58,21,1) : CLR(21,58,26,1);
 
         NSView* scoreBox = [[NSView alloc] initWithFrame:NSMakeRect(12, y, w, 44)];
         scoreBox.wantsLayer = YES;
