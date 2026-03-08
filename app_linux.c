@@ -24,6 +24,7 @@
 #include <math.h>
 #include <signal.h>
 
+#include <dirent.h>
 #include "app_common.h"
 
 #ifndef M_PI
@@ -144,10 +145,14 @@ static GtkWidget* g_canvas;
 static GtkWidget* g_sidebar;
 static GtkWidget* g_combo_proto;
 static GtkWidget* g_combo_test;
-static GtkWidget* g_entry_port;
+static GtkWidget* g_combo_port;
+static GtkWidget* g_combo_baud;
 static GtkWidget* g_btn_connect;
 static GtkWidget* g_btn_run;
 static GtkWidget* g_label_status;
+static GtkWidget* g_debug_textview;
+static GtkWidget* g_debug_scroll;
+static uint32_t   g_last_debug_count = 0;
 
 static gboolean g_app_connected = FALSE;
 static gboolean g_app_test_running = FALSE;
@@ -438,6 +443,16 @@ static gboolean on_sidebar_draw(GtkWidget* widget, cairo_t* cr, gpointer data) {
         SB_ROW("Delta reps", buf, 232/255.0, 232/255.0, 240/255.0);
         snprintf(buf, sizeof(buf), "%.3f", a->int_cv);
         SB_ROW("Interval CV", buf, 232/255.0, 232/255.0, 240/255.0);
+        snprintf(buf, sizeof(buf), "%.1f us", a->int_std_us);
+        SB_ROW("Int std dev", buf, 232/255.0, 232/255.0, 240/255.0);
+        snprintf(buf, sizeof(buf), "%.3f", a->int_skewness);
+        if (a->int_skewness < 0.1) { SB_ROW("Int skew", buf, 240/255.0, 64/255.0, 96/255.0); }
+        else { SB_ROW("Int skew", buf, 232/255.0, 232/255.0, 240/255.0); }
+        snprintf(buf, sizeof(buf), "%.3f", a->int_bimodality);
+        if (a->int_bimodality > 0.555) { SB_ROW("Int bimod", buf, 240/255.0, 64/255.0, 96/255.0); }
+        else { SB_ROW("Int bimod", buf, 232/255.0, 232/255.0, 240/255.0); }
+        snprintf(buf, sizeof(buf), "%.0f", a->int_dominant_hz);
+        SB_ROW("Dom Hz", buf, 232/255.0, 232/255.0, 240/255.0);
         y += 6;
 
         SB_HEADER("HUMANIZATION");
@@ -532,6 +547,35 @@ static gboolean on_canvas_scroll(GtkWidget* w, GdkEventScroll* ev, gpointer data
 }
 
 // ============================================================================
+// Serial Port Enumeration
+// ============================================================================
+
+static void populate_port_combo(void) {
+    gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(g_combo_port));
+    DIR* d = opendir("/dev");
+    if (!d) return;
+    struct dirent* ent;
+    int count = 0;
+    while ((ent = readdir(d)) != NULL) {
+        if (strncmp(ent->d_name, "ttyUSB", 6) == 0 ||
+            strncmp(ent->d_name, "ttyACM", 6) == 0 ||
+            strncmp(ent->d_name, "ttyAMA", 6) == 0 ||
+            strncmp(ent->d_name, "ttyS", 4) == 0) {
+            char path[280];
+            snprintf(path, sizeof(path), "/dev/%s", ent->d_name);
+            gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g_combo_port), path);
+            count++;
+        }
+    }
+    closedir(d);
+    if (count > 0)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(g_combo_port), 0);
+    else
+        gtk_entry_set_text(GTK_ENTRY(gtk_bin_get_child(GTK_BIN(g_combo_port))), "/dev/ttyUSB0");
+    debug_log_append("Enumerated %d serial ports", count);
+}
+
+// ============================================================================
 // Callbacks
 // ============================================================================
 
@@ -540,30 +584,55 @@ static void on_proto_changed(GtkComboBox* combo, gpointer data) {
     int idx = gtk_combo_box_get_active(combo);
     device_type_t type = (idx == 0) ? DEV_KMBOX : (idx == 1) ? DEV_FERRUM : DEV_MAKCU;
     proto_init(&g_proto, type);
+    int baud = g_baud_override > 0 ? g_baud_override : g_proto.profile->default_baud;
     char msg[128];
-    snprintf(msg, sizeof(msg), "Protocol: %s (baud: %d)", g_proto.profile->name, g_proto.profile->default_baud);
+    snprintf(msg, sizeof(msg), "Protocol: %s (baud: %d)", g_proto.profile->name, baud);
     gtk_label_set_text(GTK_LABEL(g_label_status), msg);
+    debug_log_append("Protocol changed: %s (default baud: %d)", g_proto.profile->name, g_proto.profile->default_baud);
+}
+
+static void on_baud_changed(GtkComboBox* combo, gpointer data) {
+    (void)data;
+    int idx = gtk_combo_box_get_active(combo);
+    if (idx == 0) {
+        g_baud_override = 0;
+        debug_log_append("Baud rate: using protocol default (%d)", g_proto.profile->default_baud);
+    } else if (idx > 0 && idx <= g_baud_rate_count) {
+        g_baud_override = g_baud_rates[idx - 1];
+        debug_log_append("Baud rate override: %d", g_baud_override);
+    }
+    if (!g_app_connected) {
+        int baud = g_baud_override > 0 ? g_baud_override : g_proto.profile->default_baud;
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Protocol: %s (baud: %d)", g_proto.profile->name, baud);
+        gtk_label_set_text(GTK_LABEL(g_label_status), msg);
+    }
 }
 
 static void on_connect_clicked(GtkButton* btn, gpointer data) {
     (void)data;
     if (g_app_connected) {
+        debug_log_append("Disconnecting...");
         serial_reader_stop();
         plat_serial_close(g_serial_fd);
         g_serial_fd = PLAT_SERIAL_INVALID;
         g_app_connected = FALSE;
         gtk_button_set_label(btn, "Connect");
         gtk_label_set_text(GTK_LABEL(g_label_status), "Disconnected");
+        debug_log_append("Disconnected");
         return;
     }
 
-    const char* port = gtk_entry_get_text(GTK_ENTRY(g_entry_port));
-    int baud = g_proto.profile->default_baud;
+    populate_port_combo();
+    const char* port = gtk_entry_get_text(GTK_ENTRY(gtk_bin_get_child(GTK_BIN(g_combo_port))));
+    int baud = g_baud_override > 0 ? g_baud_override : g_proto.profile->default_baud;
+    debug_log_append("Connecting to %s @ %d baud (%s)...", port, baud, g_proto.profile->name);
     g_serial_fd = plat_serial_open(port, baud);
     if (g_serial_fd == PLAT_SERIAL_INVALID) {
         char msg[256];
         snprintf(msg, sizeof(msg), "Failed: %s", strerror(errno));
         gtk_label_set_text(GTK_LABEL(g_label_status), msg);
+        debug_log_append("CONNECT FAILED: %s (errno=%d)", strerror(errno), errno);
         return;
     }
     serial_reader_start();
@@ -573,6 +642,7 @@ static void on_connect_clicked(GtkButton* btn, gpointer data) {
     char msg[256];
     snprintf(msg, sizeof(msg), "Connected: %s @ %d", g_proto.profile->name, baud);
     gtk_label_set_text(GTK_LABEL(g_label_status), msg);
+    debug_log_append("Connected successfully: fd=%d", g_serial_fd);
 }
 
 static gboolean on_test_done(gpointer data) {
@@ -603,13 +673,23 @@ static void* test_thread_fn(void* arg) {
     if (idx >= 0 && idx < NUM_TESTS) {
         all_tests[idx].run();
         trace_analyze();
+        debug_log_append("Test complete: %s - %lld sent, %lld ok, %lld err, score=%d (%s)",
+            all_tests[idx].name, (long long)g_stat_sent, (long long)g_stat_ok, (long long)g_stat_err,
+            (int)g_trace.analysis.h_score, g_trace.analysis.h_grade);
     }
     g_idle_add(on_test_done, NULL);
     return NULL;
 }
 
-static void on_run_clicked(GtkButton* btn, gpointer data) {
-    (void)data;
+static void on_fit_view_clicked(GtkButton* btn, gpointer data) {
+    (void)btn; (void)data;
+    int W = gtk_widget_get_allocated_width(g_canvas);
+    int H = gtk_widget_get_allocated_height(g_canvas);
+    fit_view(W, H);
+    gtk_widget_queue_draw(g_canvas);
+}
+
+static void do_run_test(void) {
     if (g_app_test_running) return;
     int idx = gtk_combo_box_get_active(GTK_COMBO_BOX(g_combo_test));
     if (idx < 0 || idx >= NUM_TESTS) return;
@@ -617,12 +697,28 @@ static void on_run_clicked(GtkButton* btn, gpointer data) {
     g_app_test_running = TRUE;
     g_run_test_idx = idx;
     g_stat_ok = 0; g_stat_err = 0; g_stat_sent = 0;
-    gtk_widget_set_sensitive(GTK_WIDGET(btn), FALSE);
-    gtk_button_set_label(btn, "Running...");
+    debug_log_append("Starting test: %s", all_tests[idx].name);
+    gtk_widget_set_sensitive(g_btn_run, FALSE);
+    gtk_button_set_label(GTK_BUTTON(g_btn_run), "Running...");
 
     pthread_t t;
     pthread_create(&t, NULL, test_thread_fn, NULL);
     pthread_detach(t);
+}
+
+static void on_run_clicked(GtkButton* btn, gpointer data) {
+    (void)btn; (void)data;
+    do_run_test();
+}
+
+static gboolean on_key_press(GtkWidget* widget, GdkEventKey* event, gpointer data) {
+    (void)widget; (void)data;
+    // Ctrl+R to run test
+    if ((event->state & GDK_CONTROL_MASK) && event->keyval == GDK_KEY_r) {
+        do_run_test();
+        return TRUE;
+    }
+    return FALSE;
 }
 
 static gboolean on_refresh_tick(gpointer data) {
@@ -655,6 +751,30 @@ static gboolean on_refresh_tick(gpointer data) {
                  ncmd, nobs, (long long)g_stat_sent);
         gtk_label_set_text(GTK_LABEL(g_label_status), msg);
     }
+
+    // Update debug log view
+    uint32_t current_count = g_debug_log.count;
+    if (current_count != g_last_debug_count && g_debug_textview) {
+        g_last_debug_count = current_count;
+        GtkTextBuffer* buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(g_debug_textview));
+        GString* text = g_string_new(NULL);
+        plat_mutex_lock(&g_debug_log.mutex);
+        uint32_t total = g_debug_log.head;
+        uint32_t start = (total > DEBUG_LOG_LINES) ? total - DEBUG_LOG_LINES : 0;
+        for (uint32_t i = start; i < total; i++) {
+            uint32_t idx = i % DEBUG_LOG_LINES;
+            g_string_append(text, g_debug_log.lines[idx]);
+            g_string_append_c(text, '\n');
+        }
+        plat_mutex_unlock(&g_debug_log.mutex);
+        gtk_text_buffer_set_text(buf, text->str, (gint)text->len);
+        g_string_free(text, TRUE);
+        // Auto-scroll to bottom
+        GtkTextIter end;
+        gtk_text_buffer_get_end_iter(buf, &end);
+        gtk_text_view_scroll_to_iter(GTK_TEXT_VIEW(g_debug_textview), &end, 0, FALSE, 0, 0);
+    }
+
     return G_SOURCE_CONTINUE;
 }
 
@@ -683,7 +803,9 @@ static const char* css_style =
     "button:hover { background-color: #22222a; }"
     "combobox button { background-color: #16161a; color: #e8e8f0; border: 1px solid #1e1e30; }"
     "checkbutton label { color: #7070a0; font-size: 11px; }"
-    ".topbar { background-color: #0b0b12; border-bottom: 1px solid #1e1e30; }";
+    ".topbar { background-color: #0b0b12; border-bottom: 1px solid #1e1e30; }"
+    ".debuglog { background-color: #10101a; color: #b0b0c0; font-family: monospace; font-size: 10px; }"
+    ".debuglog text { background-color: #10101a; color: #b0b0c0; }";
 
 // ============================================================================
 // Build GUI
@@ -702,6 +824,8 @@ static void activate_app(GtkApplication* app, gpointer user_data) {
     g_window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(g_window), "KMBox Trace Analyzer");
     gtk_window_set_default_size(GTK_WINDOW(g_window), 1400, 900);
+    gtk_widget_add_events(g_window, GDK_KEY_PRESS_MASK);
+    g_signal_connect(g_window, "key-press-event", G_CALLBACK(on_key_press), NULL);
 
     /* Main vertical layout */
     GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
@@ -727,12 +851,25 @@ static void activate_app(GtkApplication* app, gpointer user_data) {
     g_signal_connect(g_combo_proto, "changed", G_CALLBACK(on_proto_changed), NULL);
     gtk_box_pack_start(GTK_BOX(topbar), g_combo_proto, FALSE, FALSE, 0);
 
-    /* Port entry */
+    /* Port combo (editable dropdown with auto-enumerated serial ports) */
     gtk_box_pack_start(GTK_BOX(topbar), gtk_label_new("Port:"), FALSE, FALSE, 0);
-    g_entry_port = gtk_entry_new();
-    gtk_entry_set_text(GTK_ENTRY(g_entry_port), "/dev/ttyUSB0");
-    gtk_entry_set_width_chars(GTK_ENTRY(g_entry_port), 20);
-    gtk_box_pack_start(GTK_BOX(topbar), g_entry_port, FALSE, FALSE, 0);
+    g_combo_port = gtk_combo_box_text_new_with_entry();
+    gtk_entry_set_width_chars(GTK_ENTRY(gtk_bin_get_child(GTK_BIN(g_combo_port))), 20);
+    gtk_box_pack_start(GTK_BOX(topbar), g_combo_port, FALSE, FALSE, 0);
+    populate_port_combo();
+
+    /* Baud rate combo */
+    gtk_box_pack_start(GTK_BOX(topbar), gtk_label_new("Baud:"), FALSE, FALSE, 0);
+    g_combo_baud = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g_combo_baud), "Default");
+    for (int i = 0; i < g_baud_rate_count; i++) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d", g_baud_rates[i]);
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(g_combo_baud), buf);
+    }
+    gtk_combo_box_set_active(GTK_COMBO_BOX(g_combo_baud), 0);
+    g_signal_connect(g_combo_baud, "changed", G_CALLBACK(on_baud_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(topbar), g_combo_baud, FALSE, FALSE, 0);
 
     /* Connect button */
     g_btn_connect = gtk_button_new_with_label("Connect");
@@ -752,19 +889,29 @@ static void activate_app(GtkApplication* app, gpointer user_data) {
     g_signal_connect(g_btn_run, "clicked", G_CALLBACK(on_run_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(topbar), g_btn_run, FALSE, FALSE, 0);
 
+    /* Fit View button */
+    GtkWidget* btn_fit = gtk_button_new_with_label("Fit View");
+    g_signal_connect(btn_fit, "clicked", G_CALLBACK(on_fit_view_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(topbar), btn_fit, FALSE, FALSE, 0);
+
     /* Status label */
     g_label_status = gtk_label_new("Disconnected");
     gtk_label_set_xalign(GTK_LABEL(g_label_status), 0);
     gtk_box_pack_start(GTK_BOX(topbar), g_label_status, TRUE, TRUE, 0);
 
-    /* Main horizontal split: Canvas + Sidebar */
+    /* Main horizontal split: (Canvas + Debug Log) | Sidebar */
     GtkWidget* hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_paned_set_position(GTK_PANED(hpaned), 1080);
     gtk_box_pack_start(GTK_BOX(vbox), hpaned, TRUE, TRUE, 0);
 
+    /* Left side: Canvas on top, Debug Log on bottom */
+    GtkWidget* left_vpaned = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
+    gtk_paned_set_position(GTK_PANED(left_vpaned), 600);
+    gtk_paned_pack1(GTK_PANED(hpaned), left_vpaned, TRUE, TRUE);
+
     /* Canvas */
     g_canvas = gtk_drawing_area_new();
-    gtk_widget_set_size_request(g_canvas, 400, 300);
+    gtk_widget_set_size_request(g_canvas, 400, 200);
     gtk_widget_add_events(g_canvas, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
                           GDK_POINTER_MOTION_MASK | GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK);
     g_signal_connect(g_canvas, "draw", G_CALLBACK(on_canvas_draw), NULL);
@@ -772,7 +919,32 @@ static void activate_app(GtkApplication* app, gpointer user_data) {
     g_signal_connect(g_canvas, "button-release-event", G_CALLBACK(on_canvas_button_release), NULL);
     g_signal_connect(g_canvas, "motion-notify-event", G_CALLBACK(on_canvas_motion), NULL);
     g_signal_connect(g_canvas, "scroll-event", G_CALLBACK(on_canvas_scroll), NULL);
-    gtk_paned_pack1(GTK_PANED(hpaned), g_canvas, TRUE, TRUE);
+    gtk_paned_pack1(GTK_PANED(left_vpaned), g_canvas, TRUE, TRUE);
+
+    /* Debug log panel */
+    GtkWidget* debug_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_size_request(debug_box, -1, 120);
+
+    GtkWidget* debug_label = gtk_label_new("DEBUG LOG");
+    gtk_label_set_xalign(GTK_LABEL(debug_label), 0);
+    gtk_widget_set_margin_start(debug_label, 8);
+    gtk_widget_set_margin_top(debug_label, 4);
+    gtk_box_pack_start(GTK_BOX(debug_box), debug_label, FALSE, FALSE, 0);
+
+    g_debug_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(g_debug_scroll),
+        GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    g_debug_textview = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(g_debug_textview), FALSE);
+    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(g_debug_textview), FALSE);
+    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(g_debug_textview), 6);
+    gtk_text_view_set_right_margin(GTK_TEXT_VIEW(g_debug_textview), 6);
+    GtkStyleContext* dbg_ctx = gtk_widget_get_style_context(g_debug_textview);
+    gtk_style_context_add_class(dbg_ctx, "debuglog");
+    gtk_container_add(GTK_CONTAINER(g_debug_scroll), g_debug_textview);
+    gtk_box_pack_start(GTK_BOX(debug_box), g_debug_scroll, TRUE, TRUE, 0);
+
+    gtk_paned_pack2(GTK_PANED(left_vpaned), debug_box, FALSE, TRUE);
 
     /* Sidebar container */
     GtkWidget* sidebar_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
@@ -820,6 +992,7 @@ static void activate_app(GtkApplication* app, gpointer user_data) {
 
 int main(int argc, char* argv[]) {
     trace_alloc();
+    debug_log_init();
     srand((unsigned)time(NULL));
     proto_init(&g_proto, DEV_KMBOX);
 

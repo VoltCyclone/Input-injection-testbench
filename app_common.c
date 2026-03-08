@@ -10,6 +10,7 @@
 
 #include "app_common.h"
 #include <errno.h>
+#include <stdarg.h>
 
 // ============================================================================
 // Globals
@@ -24,6 +25,83 @@ volatile int64_t g_stat_sent = 0;
 
 plat_thread_t    g_reader_thread;
 volatile bool    g_reader_running = false;
+
+int g_baud_override = 0;
+
+// Common baud rates for UART devices
+const int g_baud_rates[] = {
+    9600, 19200, 38400, 57600, 115200, 230400,
+    460800, 921600, 1000000, 1500000, 2000000, 3000000, 4000000
+};
+const int g_baud_rate_count = sizeof(g_baud_rates) / sizeof(g_baud_rates[0]);
+
+// ============================================================================
+// Debug Log Ring Buffer
+// ============================================================================
+
+debug_log_t g_debug_log;
+
+void debug_log_init(void) {
+    memset(&g_debug_log, 0, sizeof(g_debug_log));
+    plat_mutex_init(&g_debug_log.mutex);
+}
+
+void debug_log_append(const char* fmt, ...) {
+    plat_mutex_lock(&g_debug_log.mutex);
+    uint32_t idx = g_debug_log.head % DEBUG_LOG_LINES;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_debug_log.lines[idx], DEBUG_LOG_LINE_LEN, fmt, ap);
+    va_end(ap);
+    g_debug_log.head++;
+    g_debug_log.count++;
+    plat_mutex_unlock(&g_debug_log.mutex);
+}
+
+void debug_log_tx(const uint8_t* data, int len) {
+    if (len <= 0) return;
+    char hex[DEBUG_LOG_LINE_LEN];
+    int pos = snprintf(hex, sizeof(hex), "TX [%d]: ", len);
+    for (int i = 0; i < len && pos < (int)sizeof(hex) - 4; i++)
+        pos += snprintf(hex + pos, sizeof(hex) - pos, "%02X ", data[i]);
+    // Also show ASCII for text protocols
+    char ascii[DEBUG_LOG_LINE_LEN];
+    int apos = 0;
+    for (int i = 0; i < len && apos < (int)sizeof(ascii) - 2; i++) {
+        if (data[i] >= 0x20 && data[i] < 0x7F)
+            ascii[apos++] = (char)data[i];
+        else if (data[i] == '\n')
+            { ascii[apos++] = '\\'; if (apos < (int)sizeof(ascii)-1) ascii[apos++] = 'n'; }
+        else if (data[i] == '\r')
+            { ascii[apos++] = '\\'; if (apos < (int)sizeof(ascii)-1) ascii[apos++] = 'r'; }
+        else
+            ascii[apos++] = '.';
+    }
+    ascii[apos] = '\0';
+    debug_log_append("%s  \"%s\"", hex, ascii);
+}
+
+void debug_log_rx(const uint8_t* data, int len) {
+    if (len <= 0) return;
+    char hex[DEBUG_LOG_LINE_LEN];
+    int pos = snprintf(hex, sizeof(hex), "RX [%d]: ", len);
+    for (int i = 0; i < len && pos < (int)sizeof(hex) - 4; i++)
+        pos += snprintf(hex + pos, sizeof(hex) - pos, "%02X ", data[i]);
+    char ascii[DEBUG_LOG_LINE_LEN];
+    int apos = 0;
+    for (int i = 0; i < len && apos < (int)sizeof(ascii) - 2; i++) {
+        if (data[i] >= 0x20 && data[i] < 0x7F)
+            ascii[apos++] = (char)data[i];
+        else if (data[i] == '\n')
+            { ascii[apos++] = '\\'; if (apos < (int)sizeof(ascii)-1) ascii[apos++] = 'n'; }
+        else if (data[i] == '\r')
+            { ascii[apos++] = '\\'; if (apos < (int)sizeof(ascii)-1) ascii[apos++] = 'r'; }
+        else
+            ascii[apos++] = '.';
+    }
+    ascii[apos] = '\0';
+    debug_log_append("%s  \"%s\"", hex, ascii);
+}
 
 // ============================================================================
 // Trace Management
@@ -220,16 +298,68 @@ void trace_analyze(void) {
     a->speed_cv = (magMean > 0.01) ? sqrt(magVar) / magMean : 0;
     a->sub_px_pct = (nobs > 1) ? (double)obsSubPx / (nobs-1) * 100.0 : 0;
 
-    /* Command timing */
+    /* Command timing — polling rate fingerprinting */
     double intSum = 0, intSqSum = 0;
     for (uint32_t i = 1; i < ncmd; i++) {
         double iv = (double)(g_trace.cmds[i].time_us - g_trace.cmds[i-1].time_us);
         intSum += iv; intSqSum += iv*iv;
     }
-    double intMean = (ncmd > 2) ? intSum / (ncmd-1) : 0;
-    double intVar = (ncmd > 2) ? (intSqSum / (ncmd-1) - intMean*intMean) : 0;
+    uint32_t nint = (ncmd > 1) ? ncmd - 1 : 0;
+    double intMean = (nint > 1) ? intSum / nint : 0;
+    double intVar = (nint > 1) ? (intSqSum / nint - intMean*intMean) : 0;
     if (intVar < 0) intVar = 0;
-    a->int_cv = (intMean > 0) ? sqrt(intVar) / intMean : 0;
+    double intStd = sqrt(intVar);
+    a->int_cv = (intMean > 0) ? intStd / intMean : 0;
+    a->int_mean_us = intMean;
+    a->int_std_us = intStd;
+
+    /* Skewness and kurtosis of interval distribution */
+    double intM3 = 0, intM4 = 0;
+    if (nint > 2 && intStd > 1e-9) {
+        for (uint32_t i = 1; i < ncmd; i++) {
+            double z = ((double)(g_trace.cmds[i].time_us - g_trace.cmds[i-1].time_us) - intMean) / intStd;
+            double z2 = z * z;
+            intM3 += z2 * z;
+            intM4 += z2 * z2;
+        }
+        a->int_skewness = intM3 / nint;
+        a->int_kurtosis = intM4 / nint - 3.0; /* excess kurtosis */
+    }
+
+    /* Sarle's bimodality coefficient: BC = (skew^2 + 1) / (kurt + 3 + 3*(n-1)^2/((n-2)*(n-3)))
+     * BC > 5/9 (~0.555) suggests bimodal or uniform distribution.
+     * Real mice: ~0.33-0.45 (unimodal, slightly skewed)
+     * Bridge devices: ~0.55-0.80 (uniform/bimodal from dual-clock) */
+    if (nint > 3) {
+        double n = (double)nint;
+        double correction = 3.0 * (n - 1.0) * (n - 1.0) / ((n - 2.0) * (n - 3.0));
+        double denom = a->int_kurtosis + correction;
+        a->int_bimodality = (denom > 1e-9) ?
+            (a->int_skewness * a->int_skewness + 1.0) / denom : 0;
+    }
+
+    /* Dominant polling rate from mode of interval distribution */
+    if (nint > 10) {
+        /* Fine histogram: 0.1ms bins from 0-3.2ms (covers 300Hz-10kHz range) */
+        for (uint32_t i = 1; i < ncmd; i++) {
+            double ms = (double)(g_trace.cmds[i].time_us - g_trace.cmds[i-1].time_us) / 1000.0;
+            int b = (int)(ms / 0.1);
+            if (b < 0) b = 0;
+            if (b > 31) b = 31;
+            a->cmd_hist_fine[b]++;
+        }
+        /* Find mode bin */
+        uint32_t modeBin = 0, modeCount = 0;
+        for (int b = 0; b < 32; b++) {
+            if (a->cmd_hist_fine[b] > modeCount) {
+                modeCount = a->cmd_hist_fine[b];
+                modeBin = b;
+            }
+        }
+        /* Convert bin center to Hz: bin b covers [b*0.1, (b+1)*0.1) ms */
+        double modeCenterMs = (modeBin + 0.5) * 0.1;
+        a->int_dominant_hz = (modeCenterMs > 0.01) ? 1000.0 / modeCenterMs : 0;
+    }
 
     /* Command delta repeats */
     uint32_t reps = 0;
@@ -289,6 +419,8 @@ void trace_analyze(void) {
      *   Sub-pixel:     2–15%         (ideal ~6%)
      *   Interval CV:   0.05–0.40     (ideal ~0.20)
      *   Path eff:      0.85–0.995    (ideal ~0.96)
+     *   Int skewness:  0.1–3.0       (ideal ~0.5, right-skew from missed polls)
+     *   Int bimodality: 0.2–0.55     (ideal ~0.38, unimodal; >0.555 = bimodal)
      */
 
     /* Gaussian-ish bell: score = exp(-0.5 * ((log(x/center)/width)^2))
@@ -296,19 +428,31 @@ void trace_analyze(void) {
     #define BELL(val, center, width) \
         (((val) > 1e-9) ? exp(-0.5 * pow(log((val)/(center)) / (width), 2)) : 0.0)
 
-    double ps  = BELL(a->perp_scatter,  0.25,  1.0);  /* 25pts */
-    double jt  = BELL(a->jit_avg,       0.03,  0.9);  /* 20pts */
-    double scv = BELL(a->speed_cv,      0.40,  0.8);  /* 20pts */
-    double dfr = BELL(a->dir_flip_rate, 10.0,  0.8);  /* 10pts */
-    double spx = BELL(a->sub_px_pct,    6.0,   0.8);  /* 5pts  */
-    double icv = BELL(a->int_cv,        0.20,  0.8);  /* 10pts */
+    double ps  = BELL(a->perp_scatter,  0.25,  1.0);  /* 22pts */
+    double jt  = BELL(a->jit_avg,       0.03,  0.9);  /* 18pts */
+    double scv = BELL(a->speed_cv,      0.40,  0.8);  /* 18pts */
+    double dfr = BELL(a->dir_flip_rate, 10.0,  0.8);  /* 8pts  */
+    double spx = BELL(a->sub_px_pct,    6.0,   0.8);  /* 4pts  */
+    double icv = BELL(a->int_cv,        0.20,  0.8);  /* 8pts  */
     double pef = (a->path_eff > 0.001 && a->path_eff < 1.0)
-               ? BELL(1.0 - a->path_eff, 0.04, 0.8) : 0.0; /* 10pts */
+               ? BELL(1.0 - a->path_eff, 0.04, 0.8) : 0.0; /* 8pts */
+
+    /* Polling rate fingerprint scores:
+     * Skewness: real mice have right-skewed interval distributions (~0.5)
+     *   from occasional missed USB polls. Bridge devices are near-zero. */
+    double isk = (a->int_skewness > 0.01) ?
+               BELL(a->int_skewness, 0.50, 0.8) : 0.0;  /* 7pts */
+
+    /* Bimodality: real mice are unimodal (~0.38). Bridge devices with
+     * dual-clock artifacts or fixed-rate re-emission are bimodal/uniform (>0.555). */
+    double ibm = (a->int_bimodality > 0.01) ?
+               BELL(a->int_bimodality, 0.38, 0.5) : 0.0; /* 7pts */
 
     #undef BELL
 
-    double h = ps * 25.0 + jt * 20.0 + scv * 20.0 + dfr * 10.0
-             + spx * 5.0 + icv * 10.0 + pef * 10.0;
+    double h = ps * 22.0 + jt * 18.0 + scv * 18.0 + dfr * 8.0
+             + spx * 4.0 + icv * 8.0 + pef * 8.0
+             + isk * 7.0 + ibm * 7.0;
     if (h > 100) h = 100;
     a->h_score = h;
     a->h_grade = (h < 15) ? "Robotic" : (h < 35) ? "Synthetic" :
@@ -334,35 +478,45 @@ void send_move_traced(int dx, int dy) {
     int len = proto_fmt_move(&g_proto, buf, sizeof(buf), (int16_t)dx, (int16_t)dy);
     if (len <= 0) return;
 
+    debug_log_tx(buf, len);
+
     int w = plat_serial_write(g_serial_fd, buf, len);
     if (w <= 0) {
         plat_usleep(200);
         w = plat_serial_write(g_serial_fd, buf, len);
     }
     if (w > 0) plat_atomic_inc(&g_stat_sent);
-    plat_usleep(100);
+    else debug_log_append("TX FAIL: write returned %d, errno=%d", w, errno);
 }
 
 static void response_cb(proto_result_t result, const uint8_t* data,
                         uint16_t len, void* ctx) {
     (void)data; (void)len; (void)ctx;
-    if (result == PROTO_OK) plat_atomic_inc(&g_stat_ok);
-    else plat_atomic_inc(&g_stat_err);
+    if (result == PROTO_OK) {
+        plat_atomic_inc(&g_stat_ok);
+    } else {
+        plat_atomic_inc(&g_stat_err);
+        debug_log_append("PROTO ERR: result=%d len=%u", (int)result, (unsigned)len);
+    }
 }
 
 static PLAT_THREAD_RETURN serial_reader_fn(void* arg) {
     (void)arg;
     uint8_t buf[256];
+    debug_log_append("Reader thread started");
     while (g_reader_running) {
         int n = plat_serial_read(g_serial_fd, buf, sizeof(buf));
         if (n > 0) {
+            debug_log_rx(buf, n);
             proto_parse(&g_proto, buf, (size_t)n, response_cb, NULL);
         } else if (n < 0) {
-            break;  /* Fatal error */
+            debug_log_append("Reader thread: fatal read error");
+            break;
         } else {
             plat_usleep(1000);
         }
     }
+    debug_log_append("Reader thread stopped");
 #ifdef PLATFORM_WINDOWS
     return 0;
 #else
@@ -624,6 +778,10 @@ void cli_print_results(const char* test_name) {
     printf("  Dir flips:    %.1f%%    (ideal ~10%%, range 3-20%%)\n", a->dir_flip_rate);
     printf("  Sub-pixel:    %.1f%%    (ideal ~6%%, range 2-15%%)\n", a->sub_px_pct);
     printf("  Interval CV:  %.3f     (ideal ~0.20, range 0.05-0.40)\n", a->int_cv);
+    printf("  Int skewness: %.3f     (ideal ~0.50, range 0.1-3.0)\n", a->int_skewness);
+    printf("  Int bimodal:  %.3f     (ideal ~0.38, >0.555 = suspicious)\n", a->int_bimodality);
+    printf("  Int std dev:  %.1f us   (bridge <30us, human 80-150us)\n", a->int_std_us);
+    printf("  Dominant Hz:  %.0f\n", a->int_dominant_hz);
     printf("  Path eff:     %.4f    (ideal ~0.96, range 0.85-0.995)\n", a->path_eff);
     printf("  Accel jerk:   %.4f\n", a->accel_jerk);
     printf("Sent/OK/ERR:  %lld/%lld/%lld\n",

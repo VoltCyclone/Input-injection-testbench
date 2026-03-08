@@ -122,7 +122,7 @@ TEST(profile_ferrum) {
 TEST(profile_makcu) {
     const device_profile_t* p = proto_get_profile(DEV_MAKCU);
     ASSERT_STR_EQ(p->short_name, "makcu");
-    ASSERT_EQ_INT(p->default_baud, 115200);
+    ASSERT_EQ_INT(p->default_baud, 921600);
     ASSERT(p->has_transform == false);
     ASSERT(p->has_bezier == true);
     ASSERT(p->has_moveto == true);
@@ -168,7 +168,7 @@ TEST(ascii_fmt_move_basic) {
     uint8_t buf[64];
     int len = proto_fmt_move(&s, buf, sizeof(buf), 10, -5);
     ASSERT(len > 0);
-    ASSERT_STR_EQ((char*)buf, "km.move(10,-5)\r\n");
+    ASSERT_STR_EQ((char*)buf, "km.move(10,-5)\n");
 }
 
 TEST(ascii_fmt_move_zero) {
@@ -177,7 +177,7 @@ TEST(ascii_fmt_move_zero) {
     uint8_t buf[64];
     int len = proto_fmt_move(&s, buf, sizeof(buf), 0, 0);
     ASSERT(len > 0);
-    ASSERT_STR_EQ((char*)buf, "km.move(0,0)\r\n");
+    ASSERT_STR_EQ((char*)buf, "km.move(0,0)\n");
 }
 
 TEST(ascii_fmt_move_extremes) {
@@ -187,11 +187,11 @@ TEST(ascii_fmt_move_extremes) {
 
     int len = proto_fmt_move(&s, buf, sizeof(buf), 127, 127);
     ASSERT(len > 0);
-    ASSERT_STR_EQ((char*)buf, "km.move(127,127)\r\n");
+    ASSERT_STR_EQ((char*)buf, "km.move(127,127)\n");
 
     len = proto_fmt_move(&s, buf, sizeof(buf), -127, -127);
     ASSERT(len > 0);
-    ASSERT_STR_EQ((char*)buf, "km.move(-127,-127)\r\n");
+    ASSERT_STR_EQ((char*)buf, "km.move(-127,-127)\n");
 }
 
 TEST(ascii_fmt_move_buffer_too_small) {
@@ -210,15 +210,15 @@ TEST(ascii_fmt_button) {
 
     int len = proto_fmt_button(&s, buf, sizeof(buf), "left", 1);
     ASSERT(len > 0);
-    ASSERT_STR_EQ((char*)buf, "km.left(1)\r\n");
+    ASSERT_STR_EQ((char*)buf, "km.left(1)\n");
 
     len = proto_fmt_button(&s, buf, sizeof(buf), "right", 0);
     ASSERT(len > 0);
-    ASSERT_STR_EQ((char*)buf, "km.right(0)\r\n");
+    ASSERT_STR_EQ((char*)buf, "km.right(0)\n");
 
     len = proto_fmt_button(&s, buf, sizeof(buf), "middle", 2);
     ASSERT(len > 0);
-    ASSERT_STR_EQ((char*)buf, "km.middle(2)\r\n");
+    ASSERT_STR_EQ((char*)buf, "km.middle(2)\n");
 }
 
 TEST(ascii_fmt_scroll) {
@@ -228,11 +228,11 @@ TEST(ascii_fmt_scroll) {
 
     int len = proto_fmt_scroll(&s, buf, sizeof(buf), 1);
     ASSERT(len > 0);
-    ASSERT_STR_EQ((char*)buf, "km.wheel(1)\r\n");
+    ASSERT_STR_EQ((char*)buf, "km.wheel(1)\n");
 
     len = proto_fmt_scroll(&s, buf, sizeof(buf), -1);
     ASSERT(len > 0);
-    ASSERT_STR_EQ((char*)buf, "km.wheel(-1)\r\n");
+    ASSERT_STR_EQ((char*)buf, "km.wheel(-1)\n");
 }
 
 TEST(ascii_fmt_transform) {
@@ -243,12 +243,12 @@ TEST(ascii_fmt_transform) {
     // Block physical mouse
     int len = proto_fmt_transform(&s, buf, sizeof(buf), 0, 0, true);
     ASSERT(len > 0);
-    ASSERT_STR_EQ((char*)buf, "km.transform(0,0,1)\r\n");
+    ASSERT_STR_EQ((char*)buf, "km.transform(0,0,1)\n");
 
     // Restore passthrough
     len = proto_fmt_transform(&s, buf, sizeof(buf), 256, 256, false);
     ASSERT(len > 0);
-    ASSERT_STR_EQ((char*)buf, "km.transform(256,256,0)\r\n");
+    ASSERT_STR_EQ((char*)buf, "km.transform(256,256,0)\n");
 }
 
 TEST(makcu_no_transform) {
@@ -396,13 +396,13 @@ TEST(ascii_reset_clears_state) {
 // ============================================================================
 
 TEST(makcu_bin_fmt_move_falls_back_to_ascii) {
-    // MAKCU binary move is undocumented; should produce ASCII km.move()
+    // MAKCU binary move is undocumented; uses short ASCII .move() (no km prefix)
     proto_state_t s;
     proto_init(&s, DEV_MAKCU);
     uint8_t buf[64];
     int len = proto_fmt_move(&s, buf, sizeof(buf), 10, -5);
     ASSERT(len > 0);
-    ASSERT_STR_EQ((char*)buf, "km.move(10,-5)\r\n");
+    ASSERT_STR_EQ((char*)buf, ".move(10,-5)\n");
 }
 
 TEST(makcu_bin_fmt_button_left) {
@@ -459,7 +459,7 @@ TEST(makcu_bin_fmt_button_unknown_falls_back_to_ascii) {
     int len = proto_fmt_button(&s, buf, sizeof(buf), "unknown_btn", 1);
     ASSERT(len > 0);
     // Should fall back to ASCII format
-    ASSERT_STR_EQ((char*)buf, "km.unknown_btn(1)\r\n");
+    ASSERT_STR_EQ((char*)buf, "km.unknown_btn(1)\n");
 }
 
 TEST(makcu_bin_fmt_scroll_falls_back_to_ascii) {
@@ -468,7 +468,7 @@ TEST(makcu_bin_fmt_scroll_falls_back_to_ascii) {
     uint8_t buf[64];
     int len = proto_fmt_scroll(&s, buf, sizeof(buf), 1);
     ASSERT(len > 0);
-    ASSERT_STR_EQ((char*)buf, "km.wheel(1)\r\n");
+    ASSERT_STR_EQ((char*)buf, "km.wheel(1)\n");
 }
 
 // ============================================================================

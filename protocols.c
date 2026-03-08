@@ -40,7 +40,7 @@ static const device_profile_t profiles[DEV_COUNT] = {
         .has_lock       = false,
         .has_turbo      = false,
         .has_raw_frame  = false,
-        .min_interval_us = 4000,   // ~250 Hz safe rate at 2M baud
+        .min_interval_us = 1000,   // ~1 kHz at 2M baud
     },
     [DEV_FERRUM] = {
         .name           = "Ferrum One",
@@ -56,13 +56,13 @@ static const device_profile_t profiles[DEV_COUNT] = {
         .has_lock       = false,
         .has_turbo      = false,
         .has_raw_frame  = false,
-        .min_interval_us = 4000,
+        .min_interval_us = 1000,   // ~1 kHz at 2M baud
     },
     [DEV_MAKCU] = {
         .name           = "MAKCU",
         .short_name     = "makcu",
         .device         = DEV_MAKCU,
-        .default_baud   = 115200,
+        .default_baud   = 921600,    // CP2102 max
         .max_delta      = 127,
         .has_transform  = false,     // Uses km.bypass() instead
         .has_bezier     = true,      // km.move(dx,dy,segs,cx1,cy1,cx2,cy2)
@@ -72,7 +72,7 @@ static const device_profile_t profiles[DEV_COUNT] = {
         .has_lock       = true,      // km.lock_<target>(), km.catch_<target>()
         .has_turbo      = true,      // km.turbo(btn,delay_ms)
         .has_raw_frame  = true,      // km.mo(btns,x,y,whl,pan,tilt)
-        .min_interval_us = 2000,     // ~500 Hz at 115200 baud
+        .min_interval_us = 200,      // ~5 kHz at 921600 baud
     },
 };
 
@@ -88,18 +88,18 @@ static const device_profile_t profiles[DEV_COUNT] = {
 // Ferrum One is a documented KMBox B+ Pro drop-in replacement.
 
 static int ascii_fmt_move(uint8_t* buf, size_t buflen, int16_t dx, int16_t dy) {
-    return snprintf((char*)buf, buflen, "km.move(%d,%d)\r\n", dx, dy);
+    return snprintf((char*)buf, buflen, "km.move(%d,%d)\n", dx, dy);
 }
 
 static int ascii_fmt_button(uint8_t* buf, size_t buflen,
                             const char* button, uint8_t state) {
     // button: "left", "right", "middle", "side1", "side2"
     // state:  0=release, 1=down, 2=silent_release (MAKCU only)
-    return snprintf((char*)buf, buflen, "km.%s(%u)\r\n", button, state);
+    return snprintf((char*)buf, buflen, "km.%s(%u)\n", button, state);
 }
 
 static int ascii_fmt_scroll(uint8_t* buf, size_t buflen, int8_t delta) {
-    return snprintf((char*)buf, buflen, "km.wheel(%d)\r\n", delta);
+    return snprintf((char*)buf, buflen, "km.wheel(%d)\n", delta);
 }
 
 static int ascii_fmt_transform(uint8_t* buf, size_t buflen,
@@ -108,7 +108,7 @@ static int ascii_fmt_transform(uint8_t* buf, size_t buflen,
     // Controls physical mouse passthrough.
     //   sx=0, sy=0, enable=1  -> block physical mouse
     //   sx=256, sy=256, enable=0 -> restore passthrough
-    return snprintf((char*)buf, buflen, "km.transform(%d,%d,%d)\r\n",
+    return snprintf((char*)buf, buflen, "km.transform(%d,%d,%d)\n",
                     sx, sy, enable ? 1 : 0);
 }
 
@@ -224,12 +224,10 @@ static int makcu_bin_frame(uint8_t* buf, size_t buflen,
     return (int)total;
 }
 
-// Binary move: not yet documented, fall back to ASCII
+// Binary move: not yet documented, use short ASCII (MAKCU accepts without km prefix)
 static int makcu_bin_fmt_move(uint8_t* buf, size_t buflen,
                               int16_t dx, int16_t dy) {
-    // The MAKCU V2 binary protocol does not document a mouse move
-    // command byte. Fall back to ASCII km.move() which MAKCU supports.
-    return ascii_fmt_move(buf, buflen, dx, dy);
+    return snprintf((char*)buf, buflen, ".move(%d,%d)\n", dx, dy);
 }
 
 // Binary button: uses documented command bytes

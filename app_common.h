@@ -50,11 +50,18 @@ typedef struct {
     double path_eff;
     double obs_total_dist;
     double int_cv;
+    double int_mean_us;
+    double int_std_us;
+    double int_skewness;
+    double int_kurtosis;
+    double int_bimodality;
+    double int_dominant_hz;
     double cmd_rep_pct;
     double h_score;
     const char* h_grade;
     uint32_t obs_moving;
     uint32_t cmd_hist[8];
+    uint32_t cmd_hist_fine[32];
     double cmd_rate, obs_rate;
     double total_ms;
     int32_t cmd_bbox_w, cmd_bbox_h;
@@ -127,5 +134,33 @@ void serial_reader_stop(void);
 
 void cli_print_results(const char* test_name);
 void print_usage(const char* prog);
+
+// ============================================================================
+// Debug Log Ring Buffer
+// ============================================================================
+
+#define DEBUG_LOG_LINES 512
+#define DEBUG_LOG_LINE_LEN 256
+
+typedef struct {
+    char     lines[DEBUG_LOG_LINES][DEBUG_LOG_LINE_LEN];
+    uint32_t head;       // next write index (wraps)
+    uint32_t count;      // total lines written (for change detection)
+    plat_mutex_t mutex;
+} debug_log_t;
+
+extern debug_log_t g_debug_log;
+
+void debug_log_init(void);
+void debug_log_append(const char* fmt, ...);
+void debug_log_tx(const uint8_t* data, int len);
+void debug_log_rx(const uint8_t* data, int len);
+
+// Common baud rate table
+extern const int g_baud_rates[];
+extern const int g_baud_rate_count;
+
+// User-selected baud override (0 = use protocol default)
+extern int g_baud_override;
 
 #endif /* APP_COMMON_H */

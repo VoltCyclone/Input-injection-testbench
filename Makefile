@@ -73,7 +73,7 @@ else ifeq ($(PLATFORM),Windows)
   ifeq ($(suffix $(TARGET)),)
     TARGET := $(TARGET).exe
   endif
-  WIN_LIBS  = -lgdi32 -luser32 -lkernel32 -lcomctl32 -lcomdlg32 -lwinmm
+  WIN_LIBS  = -lgdi32 -luser32 -lkernel32 -lcomctl32 -lcomdlg32 -lwinmm -lshell32
   CFLAGS   += -D_WIN32_WINNT=0x0601
   SRCS     = app_windows.c app_common.c protocols.c
   OBJS     = app_windows.o app_common.o protocols.o

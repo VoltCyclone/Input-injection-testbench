@@ -26,6 +26,7 @@
 #include <windowsx.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -164,10 +165,13 @@ static HWND g_hwnd_canvas;
 static HWND g_hwnd_sidebar;
 static HWND g_combo_proto;
 static HWND g_combo_test;
-static HWND g_edit_port;
+static HWND g_combo_port;
+static HWND g_combo_baud;
 static HWND g_btn_connect;
 static HWND g_btn_run;
 static HWND g_label_status;
+static HWND g_hwnd_debug;
+static uint32_t g_last_debug_count = 0;
 
 static HFONT g_font_mono;
 static HFONT g_font_mono_sm;
@@ -194,6 +198,9 @@ static double g_drag_vx, g_drag_vy;
 #define IDC_RUN        1005
 #define IDC_CANVAS     1010
 #define IDC_SIDEBAR    1011
+#define IDC_FIT        1006
+#define IDC_BAUD       1007
+#define IDC_DEBUG      1008
 #define IDC_CHK_CMD    1020
 #define IDC_CHK_OBS    1021
 #define IDC_CHK_DOTS   1022
@@ -486,6 +493,12 @@ static void paint_sidebar(HWND hwnd) {
         snprintf(buf, sizeof(buf), "%.2f px", a->dev_max); ROW("Max gap", buf, RGB_TEXT0);
         snprintf(buf, sizeof(buf), "%.0f%%", a->cmd_rep_pct); ROW("Delta reps", buf, RGB_TEXT0);
         snprintf(buf, sizeof(buf), "%.3f", a->int_cv); ROW("Interval CV", buf, RGB_TEXT0);
+        snprintf(buf, sizeof(buf), "%.1f us", a->int_std_us); ROW("Int std dev", buf, RGB_TEXT0);
+        snprintf(buf, sizeof(buf), "%.3f", a->int_skewness);
+        ROW("Int skew", buf, (a->int_skewness < 0.1) ? RGB_RED : RGB_TEXT0);
+        snprintf(buf, sizeof(buf), "%.3f", a->int_bimodality);
+        ROW("Int bimod", buf, (a->int_bimodality > 0.555) ? RGB_RED : RGB_TEXT0);
+        snprintf(buf, sizeof(buf), "%.0f", a->int_dominant_hz); ROW("Dom Hz", buf, RGB_TEXT0);
         y += 6;
 
         HEADER("HUMANIZATION");
@@ -595,6 +608,9 @@ static DWORD WINAPI test_thread_fn(LPVOID arg) {
     if (idx >= 0 && idx < NUM_TESTS) {
         all_tests[idx].run();
         trace_analyze();
+        debug_log_append("Test complete: %s - %lld sent, %lld ok, %lld err, score=%d (%s)",
+            all_tests[idx].name, (long long)g_stat_sent, (long long)g_stat_ok, (long long)g_stat_err,
+            (int)g_trace.analysis.h_score, g_trace.analysis.h_grade);
     }
     PostMessageW(g_hwnd_main, WM_APP + 1, 0, 0);
     return 0;
@@ -604,23 +620,55 @@ static DWORD WINAPI test_thread_fn(LPVOID arg) {
 // Main Window Proc
 // ============================================================================
 
+static void populate_port_combo(void) {
+    SendMessageW(g_combo_port, CB_RESETCONTENT, 0, 0);
+    int count = 0;
+    for (int i = 1; i <= 256; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "COM%d", i);
+        wchar_t wname[16];
+        char full[32];
+        snprintf(full, sizeof(full), "\\\\.\\COM%d", i);
+        wchar_t wfull[32];
+        MultiByteToWideChar(CP_UTF8, 0, full, -1, wfull, 32);
+        HANDLE h = CreateFileW(wfull, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                               OPEN_EXISTING, 0, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            CloseHandle(h);
+            MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, 16);
+            SendMessageW(g_combo_port, CB_ADDSTRING, 0, (LPARAM)wname);
+            count++;
+        }
+    }
+    if (count > 0)
+        SendMessageW(g_combo_port, CB_SETCURSEL, 0, 0);
+    else
+        SetWindowTextA(g_combo_port, "COM3");
+    debug_log_append("Enumerated %d COM ports", count);
+}
+
 static void do_connect(void) {
     if (g_connected) {
+        debug_log_append("Disconnecting...");
         serial_reader_stop();
         plat_serial_close(g_serial_fd);
         g_serial_fd = PLAT_SERIAL_INVALID;
         g_connected = false;
         SetWindowTextW(g_btn_connect, L"Connect");
         SetWindowTextW(g_label_status, L"Disconnected");
+        debug_log_append("Disconnected");
         return;
     }
 
+    populate_port_combo();
     char port[256];
-    GetWindowTextA(g_edit_port, port, sizeof(port));
-    int baud = g_proto.profile->default_baud;
+    GetWindowTextA(g_combo_port, port, sizeof(port));
+    int baud = g_baud_override > 0 ? g_baud_override : g_proto.profile->default_baud;
+    debug_log_append("Connecting to %s @ %d baud (%s)...", port, baud, g_proto.profile->name);
     g_serial_fd = plat_serial_open(port, baud);
     if (g_serial_fd == PLAT_SERIAL_INVALID) {
         SetWindowTextW(g_label_status, L"Failed to open port");
+        debug_log_append("CONNECT FAILED: could not open %s", port);
         return;
     }
     serial_reader_start();
@@ -630,6 +678,7 @@ static void do_connect(void) {
     wchar_t status[256];
     swprintf(status, 256, L"Connected: %hs @ %d", g_proto.profile->name, baud);
     SetWindowTextW(g_label_status, status);
+    debug_log_append("Connected successfully");
 }
 
 static void do_run_test(void) {
@@ -640,6 +689,7 @@ static void do_run_test(void) {
     g_test_running = true;
     g_run_test_idx = idx;
     g_stat_ok = 0; g_stat_err = 0; g_stat_sent = 0;
+    debug_log_append("Starting test: %s", all_tests[idx].name);
     EnableWindow(g_btn_run, FALSE);
     SetWindowTextW(g_btn_run, L"Running...");
 
@@ -654,9 +704,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
     case WM_SIZE: {
         int W = LOWORD(lParam), H = HIWORD(lParam);
-        int topH = 52, sideW = 320;
+        int topH = 52, sideW = 320, debugH = 140;
         if (g_hwnd_canvas)
-            MoveWindow(g_hwnd_canvas, 0, topH, W - sideW, H - topH, TRUE);
+            MoveWindow(g_hwnd_canvas, 0, topH, W - sideW, H - topH - debugH, TRUE);
+        if (g_hwnd_debug)
+            MoveWindow(g_hwnd_debug, 0, H - debugH + 18, W - sideW, debugH - 18, TRUE);
         if (g_hwnd_sidebar)
             MoveWindow(g_hwnd_sidebar, W - sideW, topH, sideW, H - topH, TRUE);
         return 0;
@@ -667,10 +719,30 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         int code = HIWORD(wParam);
         if (id == IDC_CONNECT) do_connect();
         else if (id == IDC_RUN) do_run_test();
+        else if (id == IDC_FIT) {
+            RECT rc; GetClientRect(g_hwnd_canvas, &rc);
+            fit_view(rc.right, rc.bottom);
+            InvalidateRect(g_hwnd_canvas, NULL, FALSE);
+        }
         else if (id == IDC_PROTO && code == CBN_SELCHANGE) {
             int idx = (int)SendMessageW(g_combo_proto, CB_GETCURSEL, 0, 0);
             device_type_t type = (idx == 0) ? DEV_KMBOX : (idx == 1) ? DEV_FERRUM : DEV_MAKCU;
             proto_init(&g_proto, type);
+            int baud = g_baud_override > 0 ? g_baud_override : g_proto.profile->default_baud;
+            wchar_t status[256];
+            swprintf(status, 256, L"Protocol: %hs (baud: %d)", g_proto.profile->name, baud);
+            SetWindowTextW(g_label_status, status);
+            debug_log_append("Protocol changed: %s (default baud: %d)", g_proto.profile->name, g_proto.profile->default_baud);
+        }
+        else if (id == IDC_BAUD && code == CBN_SELCHANGE) {
+            int bidx = (int)SendMessageW(g_combo_baud, CB_GETCURSEL, 0, 0);
+            if (bidx == 0) {
+                g_baud_override = 0;
+                debug_log_append("Baud rate: using protocol default (%d)", g_proto.profile->default_baud);
+            } else if (bidx > 0 && bidx <= g_baud_rate_count) {
+                g_baud_override = g_baud_rates[bidx - 1];
+                debug_log_append("Baud rate override: %d", g_baud_override);
+            }
         }
         else if (id == IDC_CHK_CMD) g_show_cmd = !g_show_cmd;
         else if (id == IDC_CHK_OBS) g_show_obs = !g_show_obs;
@@ -681,6 +753,14 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         if (g_hwnd_canvas) InvalidateRect(g_hwnd_canvas, NULL, FALSE);
         return 0;
     }
+
+    case WM_KEYDOWN:
+        // Ctrl+R to run test
+        if (wParam == 'R' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            do_run_test();
+            return 0;
+        }
+        break;
 
     case WM_TIMER:
         if (wParam == IDT_REFRESH && g_test_running && g_trace.recording) {
@@ -710,6 +790,28 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             swprintf(status, 256, L"Recording: %u cmd, %u obs - %lld sent",
                      ncmd, nobs, (long long)g_stat_sent);
             SetWindowTextW(g_label_status, status);
+        }
+        /* Update debug log */
+        {
+            uint32_t current_count = g_debug_log.count;
+            if (current_count != g_last_debug_count && g_hwnd_debug) {
+                g_last_debug_count = current_count;
+                char text[32768] = {0};
+                int pos = 0;
+                plat_mutex_lock(&g_debug_log.mutex);
+                uint32_t total = g_debug_log.head;
+                uint32_t start = (total > DEBUG_LOG_LINES) ? total - DEBUG_LOG_LINES : 0;
+                for (uint32_t i = start; i < total && pos < (int)sizeof(text) - DEBUG_LOG_LINE_LEN - 4; i++) {
+                    uint32_t idx = i % DEBUG_LOG_LINES;
+                    pos += snprintf(text + pos, sizeof(text) - pos, "%s\r\n", g_debug_log.lines[idx]);
+                }
+                plat_mutex_unlock(&g_debug_log.mutex);
+                SetWindowTextA(g_hwnd_debug, text);
+                /* Auto-scroll to bottom */
+                int len = GetWindowTextLengthA(g_hwnd_debug);
+                SendMessageA(g_hwnd_debug, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+                SendMessageA(g_hwnd_debug, EM_SCROLLCARET, 0, 0);
+            }
         }
         return 0;
 
@@ -809,10 +911,24 @@ static void create_ui(HINSTANCE hInst) {
 
     CreateWindowW(L"STATIC", L"Serial Port:", WS_CHILD | WS_VISIBLE,
         x, 4, 80, 20, g_hwnd_main, NULL, hInst, NULL);
-    g_edit_port = CreateWindowA("EDIT", "COM3",
-        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-        x, 24, 160, 22, g_hwnd_main, (HMENU)IDC_PORT, hInst, NULL);
-    x += 170;
+    g_combo_port = CreateWindowW(L"COMBOBOX", NULL,
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | CBS_AUTOHSCROLL,
+        x, 24, 140, 200, g_hwnd_main, (HMENU)IDC_PORT, hInst, NULL);
+    x += 150;
+
+    CreateWindowW(L"STATIC", L"Baud:", WS_CHILD | WS_VISIBLE,
+        x, 4, 40, 20, g_hwnd_main, NULL, hInst, NULL);
+    g_combo_baud = CreateWindowW(L"COMBOBOX", NULL,
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
+        x, 24, 100, 300, g_hwnd_main, (HMENU)IDC_BAUD, hInst, NULL);
+    SendMessageA(g_combo_baud, CB_ADDSTRING, 0, (LPARAM)"Default");
+    for (int i = 0; i < g_baud_rate_count; i++) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d", g_baud_rates[i]);
+        SendMessageA(g_combo_baud, CB_ADDSTRING, 0, (LPARAM)buf);
+    }
+    SendMessageW(g_combo_baud, CB_SETCURSEL, 0, 0);
+    x += 110;
 
     g_btn_connect = CreateWindowW(L"BUTTON", L"Connect",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
@@ -834,6 +950,11 @@ static void create_ui(HINSTANCE hInst) {
         x, 22, 80, 26, g_hwnd_main, (HMENU)IDC_RUN, hInst, NULL);
     x += 90;
 
+    CreateWindowW(L"BUTTON", L"Fit View",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        x, 22, 70, 26, g_hwnd_main, (HMENU)IDC_FIT, hInst, NULL);
+    x += 80;
+
     g_label_status = CreateWindowW(L"STATIC", L"Disconnected",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
         x, 28, 300, 20, g_hwnd_main, NULL, hInst, NULL);
@@ -842,11 +963,22 @@ static void create_ui(HINSTANCE hInst) {
     int cy = topH + 4;
     /* These go in the sidebar area for simplicity, but we put them at bottom of main */
 
+    int debugH = 140;
+
     /* Canvas */
     g_hwnd_canvas = CreateWindowW(L"KMBoxCanvas", NULL,
         WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
-        0, topH, winW - sideW, winH - topH,
+        0, topH, winW - sideW, winH - topH - debugH,
         g_hwnd_main, (HMENU)IDC_CANVAS, hInst, NULL);
+
+    /* Debug log panel */
+    CreateWindowW(L"STATIC", L"DEBUG LOG", WS_CHILD | WS_VISIBLE,
+        4, winH - debugH, 80, 16, g_hwnd_main, NULL, hInst, NULL);
+    g_hwnd_debug = CreateWindowA("EDIT", "",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL |
+        ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+        0, winH - debugH + 18, winW - sideW, debugH - 18,
+        g_hwnd_main, (HMENU)IDC_DEBUG, hInst, NULL);
 
     /* Sidebar */
     g_hwnd_sidebar = CreateWindowW(L"KMBoxSidebar", NULL,
@@ -857,10 +989,16 @@ static void create_ui(HINSTANCE hInst) {
     /* Send fonts to controls */
     SendMessageW(g_combo_proto, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
     SendMessageW(g_combo_test, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
-    SendMessageW(g_edit_port, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
+    SendMessageW(g_combo_port, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
+    SendMessageW(g_combo_baud, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
     SendMessageW(g_btn_connect, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
     SendMessageW(g_btn_run, WM_SETFONT, (WPARAM)g_font_ui, TRUE);
+    SendMessageW(GetDlgItem(g_hwnd_main, IDC_FIT), WM_SETFONT, (WPARAM)g_font_ui, TRUE);
     SendMessageW(g_label_status, WM_SETFONT, (WPARAM)g_font_mono_sm, TRUE);
+    SendMessageW(g_hwnd_debug, WM_SETFONT, (WPARAM)g_font_mono_sm, TRUE);
+
+    /* Enumerate COM ports */
+    populate_port_combo();
 
     SetTimer(g_hwnd_main, IDT_REFRESH, 50, NULL);
     ShowWindow(g_hwnd_main, SW_SHOW);
@@ -871,6 +1009,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmdLine, int nCmdSh
     (void)hPrev; (void)cmdLine; (void)nCmdShow;
 
     trace_alloc();
+    debug_log_init();
     srand((unsigned)GetTickCount());
     proto_init(&g_proto, DEV_KMBOX);
 

@@ -37,6 +37,7 @@
 #include <IOKit/serial/ioss.h>
 #include <signal.h>
 #include <math.h>
+#include <stdarg.h>
 #include "protocols.h"
 
 #ifndef M_PI
@@ -131,11 +132,18 @@ typedef struct {
     double path_eff;
     double obs_total_dist;
     double int_cv;
+    double int_mean_us;
+    double int_std_us;
+    double int_skewness;
+    double int_kurtosis;
+    double int_bimodality;
+    double int_dominant_hz;
     double cmd_rep_pct;
     double h_score;
     const char* h_grade;
     uint32_t obs_moving;
     uint32_t cmd_hist[8]; // Interval histogram buckets
+    uint32_t cmd_hist_fine[32]; // Fine 0.1ms bins for polling rate analysis
     double cmd_rate, obs_rate;
     double total_ms;
     int32_t cmd_bbox_w, cmd_bbox_h;
@@ -351,16 +359,62 @@ static void trace_analyze(void) {
     a->speed_cv = (magMean > 0.01) ? sqrt(magVar) / magMean : 0;
     a->sub_px_pct = (nobs > 1) ? (double)obsSubPx / (nobs-1) * 100.0 : 0;
 
-    // Command timing
+    // Command timing — polling rate fingerprinting
     double intSum = 0, intSqSum = 0;
     for (uint32_t i = 1; i < ncmd; i++) {
         double iv = (double)(g_trace.cmds[i].time_us - g_trace.cmds[i-1].time_us);
         intSum += iv; intSqSum += iv*iv;
     }
-    double intMean = (ncmd > 2) ? intSum / (ncmd-1) : 0;
-    double intVar = (ncmd > 2) ? (intSqSum / (ncmd-1) - intMean*intMean) : 0;
+    uint32_t nint = (ncmd > 1) ? ncmd - 1 : 0;
+    double intMean = (nint > 1) ? intSum / nint : 0;
+    double intVar = (nint > 1) ? (intSqSum / nint - intMean*intMean) : 0;
     if (intVar < 0) intVar = 0;
-    a->int_cv = (intMean > 0) ? sqrt(intVar) / intMean : 0;
+    double intStd = sqrt(intVar);
+    a->int_cv = (intMean > 0) ? intStd / intMean : 0;
+    a->int_mean_us = intMean;
+    a->int_std_us = intStd;
+
+    // Skewness and kurtosis of interval distribution
+    double intM3 = 0, intM4 = 0;
+    if (nint > 2 && intStd > 1e-9) {
+        for (uint32_t i = 1; i < ncmd; i++) {
+            double z = ((double)(g_trace.cmds[i].time_us - g_trace.cmds[i-1].time_us) - intMean) / intStd;
+            double z2 = z * z;
+            intM3 += z2 * z;
+            intM4 += z2 * z2;
+        }
+        a->int_skewness = intM3 / nint;
+        a->int_kurtosis = intM4 / nint - 3.0;
+    }
+
+    // Sarle's bimodality coefficient
+    if (nint > 3) {
+        double n = (double)nint;
+        double correction = 3.0 * (n - 1.0) * (n - 1.0) / ((n - 2.0) * (n - 3.0));
+        double denom = a->int_kurtosis + correction;
+        a->int_bimodality = (denom > 1e-9) ?
+            (a->int_skewness * a->int_skewness + 1.0) / denom : 0;
+    }
+
+    // Dominant polling rate from mode of interval distribution
+    if (nint > 10) {
+        for (uint32_t i = 1; i < ncmd; i++) {
+            double ms = (double)(g_trace.cmds[i].time_us - g_trace.cmds[i-1].time_us) / 1000.0;
+            int b = (int)(ms / 0.1);
+            if (b < 0) b = 0;
+            if (b > 31) b = 31;
+            a->cmd_hist_fine[b]++;
+        }
+        uint32_t modeBin = 0, modeCount = 0;
+        for (int b = 0; b < 32; b++) {
+            if (a->cmd_hist_fine[b] > modeCount) {
+                modeCount = a->cmd_hist_fine[b];
+                modeBin = b;
+            }
+        }
+        double modeCenterMs = (modeBin + 0.5) * 0.1;
+        a->int_dominant_hz = (modeCenterMs > 0.01) ? 1000.0 / modeCenterMs : 0;
+    }
 
     // Command delta repeats
     uint32_t reps = 0;
@@ -420,31 +474,124 @@ static void trace_analyze(void) {
     //   Sub-pixel:     2–15%         (ideal ~6%)
     //   Interval CV:   0.05–0.40     (ideal ~0.20)
     //   Path eff:      0.85–0.995    (ideal ~0.96)
+    //   Int skewness:  0.1–3.0       (ideal ~0.5, right-skew from missed polls)
+    //   Int bimodality: 0.2–0.55     (ideal ~0.38, unimodal; >0.555 = bimodal)
 
     // Gaussian-ish bell: score = exp(-0.5 * ((log(x/center)/width)^2))
     // Returns 0–1, peaks at center, symmetric on log scale
     #define BELL(val, center, width) \
         (((val) > 1e-9) ? exp(-0.5 * pow(log((val)/(center)) / (width), 2)) : 0.0)
 
-    double ps  = BELL(a->perp_scatter,  0.25,  1.0);  // 25pts
-    double jt  = BELL(a->jit_avg,       0.03,  0.9);  // 20pts
-    double scv = BELL(a->speed_cv,      0.40,  0.8);  // 20pts
-    double dfr = BELL(a->dir_flip_rate, 10.0,  0.8);  // 10pts
-    double spx = BELL(a->sub_px_pct,    6.0,   0.8);  // 5pts
-    double icv = BELL(a->int_cv,        0.20,  0.8);  // 10pts
+    double ps  = BELL(a->perp_scatter,  0.25,  1.0);  // 22pts
+    double jt  = BELL(a->jit_avg,       0.03,  0.9);  // 18pts
+    double scv = BELL(a->speed_cv,      0.40,  0.8);  // 18pts
+    double dfr = BELL(a->dir_flip_rate, 10.0,  0.8);  // 8pts
+    double spx = BELL(a->sub_px_pct,    6.0,   0.8);  // 4pts
+    double icv = BELL(a->int_cv,        0.20,  0.8);  // 8pts
     double pef = (a->path_eff > 0.001 && a->path_eff < 1.0)
-               ? BELL(1.0 - a->path_eff, 0.04, 0.8) : 0.0; // 10pts
+               ? BELL(1.0 - a->path_eff, 0.04, 0.8) : 0.0; // 8pts
+
+    double isk = (a->int_skewness > 0.01) ?
+               BELL(a->int_skewness, 0.50, 0.8) : 0.0;  // 7pts
+    double ibm = (a->int_bimodality > 0.01) ?
+               BELL(a->int_bimodality, 0.38, 0.5) : 0.0; // 7pts
 
     #undef BELL
 
-    double h = ps * 25.0 + jt * 20.0 + scv * 20.0 + dfr * 10.0
-             + spx * 5.0 + icv * 10.0 + pef * 10.0;
+    double h = ps * 22.0 + jt * 18.0 + scv * 18.0 + dfr * 8.0
+             + spx * 4.0 + icv * 8.0 + pef * 8.0
+             + isk * 7.0 + ibm * 7.0;
     if (h > 100) h = 100;
     a->h_score = h;
     a->h_grade = (h < 15) ? "Robotic" : (h < 35) ? "Synthetic" :
                  (h < 55) ? "Plausible" : (h < 75) ? "Convincing" : "Human";
 
     g_trace.analysis_valid = true;
+}
+
+// ============================================================================
+// Debug Log Ring Buffer
+// ============================================================================
+
+#define DEBUG_LOG_LINES 512
+#define DEBUG_LOG_LINE_LEN 256
+
+static struct {
+    char     lines[DEBUG_LOG_LINES][DEBUG_LOG_LINE_LEN];
+    uint32_t head;
+    uint32_t count;
+    pthread_mutex_t mutex;
+} g_debug_log;
+
+static void debug_log_init(void) {
+    memset(&g_debug_log, 0, sizeof(g_debug_log));
+    pthread_mutex_init(&g_debug_log.mutex, NULL);
+}
+
+__attribute__((format(printf, 1, 2)))
+static void debug_log_append(const char* fmt, ...) {
+    pthread_mutex_lock(&g_debug_log.mutex);
+    uint32_t idx = g_debug_log.head % DEBUG_LOG_LINES;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_debug_log.lines[idx], DEBUG_LOG_LINE_LEN, fmt, ap);
+    va_end(ap);
+    g_debug_log.head++;
+    g_debug_log.count++;
+    pthread_mutex_unlock(&g_debug_log.mutex);
+}
+
+static void debug_log_hex(const char* prefix, const uint8_t* data, int len) {
+    if (len <= 0) return;
+    char hex[DEBUG_LOG_LINE_LEN];
+    int pos = snprintf(hex, sizeof(hex), "%s [%d]: ", prefix, len);
+    for (int i = 0; i < len && pos < (int)sizeof(hex) - 4; i++)
+        pos += snprintf(hex + pos, sizeof(hex) - pos, "%02X ", data[i]);
+    char ascii[128];
+    int apos = 0;
+    for (int i = 0; i < len && apos < (int)sizeof(ascii) - 2; i++) {
+        if (data[i] >= 0x20 && data[i] < 0x7F)
+            ascii[apos++] = (char)data[i];
+        else if (data[i] == '\n')
+            { ascii[apos++] = '\\'; if (apos < (int)sizeof(ascii)-1) ascii[apos++] = 'n'; }
+        else if (data[i] == '\r')
+            { ascii[apos++] = '\\'; if (apos < (int)sizeof(ascii)-1) ascii[apos++] = 'r'; }
+        else
+            ascii[apos++] = '.';
+    }
+    ascii[apos] = '\0';
+    debug_log_append("%s  \"%s\"", hex, ascii);
+}
+
+// ============================================================================
+// Baud Rate Table
+// ============================================================================
+
+static const int g_baud_rates[] = {
+    9600, 19200, 38400, 57600, 115200, 230400,
+    460800, 921600, 1000000, 1500000, 2000000, 3000000, 4000000
+};
+static const int g_baud_rate_count = sizeof(g_baud_rates) / sizeof(g_baud_rates[0]);
+static int g_baud_override = 0;
+
+// ============================================================================
+// Serial Port Enumeration
+// ============================================================================
+
+static NSArray<NSString*>* enumerate_serial_ports(void) {
+    NSMutableArray* ports = [NSMutableArray array];
+    NSFileManager* fm = [NSFileManager defaultManager];
+    NSArray* devContents = [fm contentsOfDirectoryAtPath:@"/dev" error:nil];
+    for (NSString* entry in devContents) {
+        if ([entry hasPrefix:@"tty.usb"] || [entry hasPrefix:@"tty.usbmodem"] ||
+            [entry hasPrefix:@"tty.usbserial"] || [entry hasPrefix:@"tty.wch"] ||
+            [entry hasPrefix:@"cu.usb"] || [entry hasPrefix:@"cu.usbmodem"] ||
+            [entry hasPrefix:@"cu.usbserial"] || [entry hasPrefix:@"cu.wch"]) {
+            [ports addObject:[@"/dev/" stringByAppendingString:entry]];
+        }
+    }
+    [ports sortUsingSelector:@selector(compare:)];
+    return ports;
 }
 
 // ============================================================================
@@ -511,13 +658,15 @@ static void send_move_traced(int dx, int dy) {
     int len = proto_fmt_move(&g_proto, buf, sizeof(buf), (int16_t)dx, (int16_t)dy);
     if (len <= 0) return;
 
+    debug_log_hex("TX", buf, len);
+
     ssize_t w = write(g_serial_fd, buf, len);
     if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         usleep(200);
         w = write(g_serial_fd, buf, len);
     }
     if (w > 0) __sync_fetch_and_add(&g_stat_sent, 1);
-    usleep(100);
+    else debug_log_append("TX FAIL: write returned %zd, errno=%d", w, errno);
 }
 
 // Serial reader thread
@@ -527,23 +676,31 @@ static volatile bool g_reader_running = false;
 static void response_cb(proto_result_t result, const uint8_t* data,
                         uint16_t len, void* ctx) {
     (void)data; (void)len; (void)ctx;
-    if (result == PROTO_OK) __sync_fetch_and_add(&g_stat_ok, 1);
-    else __sync_fetch_and_add(&g_stat_err, 1);
+    if (result == PROTO_OK) {
+        __sync_fetch_and_add(&g_stat_ok, 1);
+    } else {
+        __sync_fetch_and_add(&g_stat_err, 1);
+        debug_log_append("PROTO ERR: result=%d len=%u", (int)result, (unsigned)len);
+    }
 }
 
 static void* serial_reader_fn(void* arg) {
     (void)arg;
     uint8_t buf[256];
+    debug_log_append("Reader thread started");
     while (g_reader_running) {
         ssize_t n = read(g_serial_fd, buf, sizeof(buf));
         if (n > 0) {
+            debug_log_hex("RX", buf, (int)n);
             proto_parse(&g_proto, buf, n, response_cb, NULL);
         } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            debug_log_append("Reader thread: fatal read error, errno=%d", errno);
             break;
         } else {
             usleep(1000);
         }
     }
+    debug_log_append("Reader thread stopped");
     return NULL;
 }
 
@@ -1152,8 +1309,12 @@ static void test_diag_ease(void) {
 }
 
 - (void)scrollWheel:(NSEvent*)event {
+    CGFloat delta = event.deltaY;
+    if (fabs(delta) < 0.001) return;
+    if (delta > 3.0) delta = 3.0;
+    if (delta < -3.0) delta = -3.0;
     NSPoint loc = [self convertPoint:event.locationInWindow fromView:nil];
-    CGFloat factor = (event.deltaY < 0) ? (1.0/1.15) : 1.15;
+    CGFloat factor = pow(1.15, delta);
     _viewX = loc.x - (loc.x - _viewX) * factor;
     _viewY = loc.y - (loc.y - _viewY) * factor;
     _viewScale *= factor;
@@ -1166,20 +1327,25 @@ static void test_diag_ease(void) {
 // AppDelegate - Window setup, controls, test management
 // ============================================================================
 
-@interface AppDelegate : NSObject <NSApplicationDelegate, NSToolbarDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSToolbarDelegate, NSComboBoxDataSource, NSComboBoxDelegate>
 @property (strong) NSWindow* window;
 @property (strong) TraceCanvasView* canvas;
 @property (strong) NSScrollView* sidebarScroll;
 @property (strong) NSView* sidebarContent;
 @property (strong) NSPopUpButton* protoPopup;
 @property (strong) NSPopUpButton* testPopup;
-@property (strong) NSTextField* portField;
+@property (strong) NSComboBox* portCombo;
+@property (strong) NSPopUpButton* baudPopup;
 @property (strong) NSButton* connectBtn;
 @property (strong) NSButton* runBtn;
 @property (strong) NSTextField* statusLabel;
+@property (strong) NSScrollView* debugScrollView;
+@property (strong) NSTextView* debugTextView;
 @property (strong) NSTimer* refreshTimer;
+@property (strong) NSArray<NSString*>* serialPorts;
 @property (nonatomic) BOOL connected;
 @property (nonatomic) BOOL testRunning;
+@property (nonatomic) uint32_t lastDebugCount;
 @end
 
 @implementation AppDelegate
@@ -1188,8 +1354,11 @@ static void test_diag_ease(void) {
     (void)notification;
     init_colors();
     trace_alloc();
+    debug_log_init();
     srand((unsigned)time(NULL));
     proto_init(&g_proto, DEV_KMBOX);
+    _serialPorts = enumerate_serial_ports();
+    debug_log_append("App started, found %lu serial ports", (unsigned long)_serialPorts.count);
 
     // ---- Main Window ----
     NSRect screenRect = [[NSScreen mainScreen] visibleFrame];
@@ -1237,19 +1406,46 @@ static void test_diag_ease(void) {
     [topBar addSubview:_protoPopup];
     x += 120;
 
-    // Port field
+    // Port combo box (editable dropdown with auto-enumerated serial ports)
     NSTextField* portLabel = [NSTextField labelWithString:@"Serial Port"];
     portLabel.font = [NSFont systemFontOfSize:10 weight:NSFontWeightMedium];
     portLabel.textColor = col_text2;
     portLabel.frame = NSMakeRect(x, 30, 80, 16);
     [topBar addSubview:portLabel];
 
-    _portField = [[NSTextField alloc] initWithFrame:NSMakeRect(x, 4, 200, 26)];
-    _portField.stringValue = @"/dev/tty.usbmodem2101";
-    _portField.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
-    _portField.placeholderString = @"/dev/tty.usbmodem...";
-    [topBar addSubview:_portField];
+    _portCombo = [[NSComboBox alloc] initWithFrame:NSMakeRect(x, 4, 200, 26)];
+    _portCombo.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    _portCombo.placeholderString = @"/dev/tty.usbmodem...";
+    _portCombo.completes = YES;
+    _portCombo.usesDataSource = NO;
+    for (NSString* port in _serialPorts) {
+        [_portCombo addItemWithObjectValue:port];
+    }
+    if (_serialPorts.count > 0) {
+        [_portCombo selectItemAtIndex:0];
+        _portCombo.stringValue = _serialPorts[0];
+    } else {
+        _portCombo.stringValue = @"/dev/tty.usbmodem2101";
+    }
+    [topBar addSubview:_portCombo];
     x += 210;
+
+    // Baud rate popup
+    NSTextField* baudLabel = [NSTextField labelWithString:@"Baud Rate"];
+    baudLabel.font = [NSFont systemFontOfSize:10 weight:NSFontWeightMedium];
+    baudLabel.textColor = col_text2;
+    baudLabel.frame = NSMakeRect(x, 30, 70, 16);
+    [topBar addSubview:baudLabel];
+
+    _baudPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(x, 4, 100, 26) pullsDown:NO];
+    [_baudPopup addItemWithTitle:@"Default"];
+    for (int i = 0; i < g_baud_rate_count; i++) {
+        [_baudPopup addItemWithTitle:[NSString stringWithFormat:@"%d", g_baud_rates[i]]];
+    }
+    _baudPopup.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    [_baudPopup setTarget:self]; [_baudPopup setAction:@selector(baudChanged:)];
+    [topBar addSubview:_baudPopup];
+    x += 110;
 
     // Connect button
     _connectBtn = [[NSButton alloc] initWithFrame:NSMakeRect(x, 4, 80, 26)];
@@ -1278,9 +1474,19 @@ static void test_diag_ease(void) {
     _runBtn = [[NSButton alloc] initWithFrame:NSMakeRect(x, 4, 80, 26)];
     _runBtn.title = @"▶ Run";
     _runBtn.bezelStyle = NSBezelStyleRounded;
+    _runBtn.keyEquivalent = @"r";
+    _runBtn.keyEquivalentModifierMask = NSEventModifierFlagCommand;
     [_runBtn setTarget:self]; [_runBtn setAction:@selector(runTest:)];
     [topBar addSubview:_runBtn];
     x += 90;
+
+    // Fit View button
+    NSButton* fitBtn = [[NSButton alloc] initWithFrame:NSMakeRect(x, 4, 70, 26)];
+    fitBtn.title = @"Fit View";
+    fitBtn.bezelStyle = NSBezelStyleRounded;
+    [fitBtn setTarget:self]; [fitBtn setAction:@selector(fitViewAction:)];
+    [topBar addSubview:fitBtn];
+    x += 80;
 
     // Status
     _statusLabel = [NSTextField labelWithString:@"Disconnected"];
@@ -1297,13 +1503,52 @@ static void test_diag_ease(void) {
     borderLine.autoresizingMask = NSViewWidthSizable;
     [topBar addSubview:borderLine];
 
-    // ---- Split: Canvas + Sidebar ----
+    // ---- Split: Canvas + Debug Log + Sidebar ----
     CGFloat bodyH = winH - 52;
     CGFloat sideW = 320;
+    CGFloat debugH = 140;
 
-    _canvas = [[TraceCanvasView alloc] initWithFrame:NSMakeRect(0, 0, winW - sideW, bodyH)];
+    _canvas = [[TraceCanvasView alloc] initWithFrame:NSMakeRect(0, debugH, winW - sideW, bodyH - debugH)];
     _canvas.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [content addSubview:_canvas];
+
+    // Debug log panel (bottom of canvas area)
+    NSView* debugBg = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, winW - sideW, debugH)];
+    debugBg.wantsLayer = YES;
+    debugBg.layer.backgroundColor = [col_bg2 CGColor];
+    debugBg.autoresizingMask = NSViewWidthSizable;
+    [content addSubview:debugBg];
+
+    // Debug header
+    NSTextField* debugHeader = [NSTextField labelWithString:@"DEBUG LOG"];
+    debugHeader.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightBold];
+    debugHeader.textColor = col_text3;
+    debugHeader.frame = NSMakeRect(8, debugH - 18, 100, 14);
+    [debugBg addSubview:debugHeader];
+
+    // Debug border top
+    NSView* debugBorder = [[NSView alloc] initWithFrame:NSMakeRect(0, debugH - 1, winW - sideW, 1)];
+    debugBorder.wantsLayer = YES;
+    debugBorder.layer.backgroundColor = [col_border CGColor];
+    debugBorder.autoresizingMask = NSViewWidthSizable;
+    [debugBg addSubview:debugBorder];
+
+    _debugScrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, winW - sideW, debugH - 20)];
+    _debugScrollView.hasVerticalScroller = YES;
+    _debugScrollView.autoresizingMask = NSViewWidthSizable;
+    _debugScrollView.drawsBackground = NO;
+    _debugScrollView.borderType = NSNoBorder;
+
+    _debugTextView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, winW - sideW - 17, debugH - 20)];
+    _debugTextView.editable = NO;
+    _debugTextView.selectable = YES;
+    _debugTextView.backgroundColor = col_bg2;
+    _debugTextView.textColor = col_text1;
+    _debugTextView.font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    _debugTextView.autoresizingMask = NSViewWidthSizable;
+    _debugTextView.textContainerInset = NSMakeSize(6, 4);
+    _debugScrollView.documentView = _debugTextView;
+    [debugBg addSubview:_debugScrollView];
 
     // Sidebar
     NSView* sidebarBg = [[NSView alloc] initWithFrame:NSMakeRect(winW - sideW, 0, sideW, bodyH)];
@@ -1412,6 +1657,12 @@ static void test_diag_ease(void) {
         addRow(@"Max cmd/obs gap", [NSString stringWithFormat:@"%.2f px", a->dev_max], nil);
         addRow(@"Delta repeats", [NSString stringWithFormat:@"%.0f%%", a->cmd_rep_pct], nil);
         addRow(@"Interval CV", [NSString stringWithFormat:@"%.3f", a->int_cv], nil);
+        addRow(@"Int std dev", [NSString stringWithFormat:@"%.1f µs", a->int_std_us], nil);
+        NSColor* skewCol = (a->int_skewness < 0.1) ? col_red : (a->int_skewness > 3.0) ? col_yellow : nil;
+        addRow(@"Int skewness", [NSString stringWithFormat:@"%.3f", a->int_skewness], skewCol);
+        NSColor* bimodCol = (a->int_bimodality > 0.555) ? col_red : nil;
+        addRow(@"Int bimodality", [NSString stringWithFormat:@"%.3f", a->int_bimodality], bimodCol);
+        addRow(@"Dominant Hz", [NSString stringWithFormat:@"%.0f", a->int_dominant_hz], nil);
         y += 8;
 
         // Humanization score
@@ -1552,29 +1803,62 @@ static void test_diag_ease(void) {
 
 // ---- Actions ----
 
+- (void)fitViewAction:(id)sender {
+    (void)sender;
+    [_canvas fitView];
+    [_canvas setNeedsDisplay:YES];
+}
+
 - (void)protoChanged:(id)sender {
+    (void)sender;
     NSInteger idx = [_protoPopup indexOfSelectedItem];
     device_type_t type = (idx == 0) ? DEV_KMBOX : (idx == 1) ? DEV_FERRUM : DEV_MAKCU;
     proto_init(&g_proto, type);
+    int baud = g_baud_override > 0 ? g_baud_override : g_proto.profile->default_baud;
     _statusLabel.stringValue = [NSString stringWithFormat:@"Protocol: %s (baud: %d)",
-        g_proto.profile->name, g_proto.profile->default_baud];
+        g_proto.profile->name, baud];
+    debug_log_append("Protocol changed: %s (default baud: %d)", g_proto.profile->name, g_proto.profile->default_baud);
+}
+
+- (void)baudChanged:(id)sender {
+    (void)sender;
+    NSInteger idx = [_baudPopup indexOfSelectedItem];
+    if (idx == 0) {
+        g_baud_override = 0;
+        debug_log_append("Baud rate: using protocol default (%d)", g_proto.profile->default_baud);
+    } else {
+        g_baud_override = g_baud_rates[idx - 1];
+        debug_log_append("Baud rate override: %d", g_baud_override);
+    }
+    int baud = g_baud_override > 0 ? g_baud_override : g_proto.profile->default_baud;
+    if (!_connected) {
+        _statusLabel.stringValue = [NSString stringWithFormat:@"Protocol: %s (baud: %d)",
+            g_proto.profile->name, baud];
+    }
 }
 
 - (void)toggleConnect:(id)sender {
+    (void)sender;
     if (_connected) {
         // Disconnect
+        debug_log_append("Disconnecting...");
         g_reader_running = false;
         pthread_join(g_reader_thread, NULL);
         close(g_serial_fd); g_serial_fd = -1;
         _connected = NO;
         _connectBtn.title = @"Connect";
         _statusLabel.stringValue = @"Disconnected";
+        debug_log_append("Disconnected");
     } else {
-        const char* port = [_portField.stringValue UTF8String];
-        int baud = g_proto.profile->default_baud;
+        // Refresh port list before connecting
+        _serialPorts = enumerate_serial_ports();
+        const char* port = [_portCombo.stringValue UTF8String];
+        int baud = g_baud_override > 0 ? g_baud_override : g_proto.profile->default_baud;
+        debug_log_append("Connecting to %s @ %d baud (%s)...", port, baud, g_proto.profile->name);
         g_serial_fd = serial_open(port, baud);
         if (g_serial_fd < 0) {
             _statusLabel.stringValue = [NSString stringWithFormat:@"Failed: %s", strerror(errno)];
+            debug_log_append("CONNECT FAILED: %s (errno=%d)", strerror(errno), errno);
             return;
         }
         g_reader_running = true;
@@ -1583,10 +1867,12 @@ static void test_diag_ease(void) {
         _connectBtn.title = @"Disconnect";
         _statusLabel.stringValue = [NSString stringWithFormat:@"Connected: %s @ %d",
             g_proto.profile->name, baud];
+        debug_log_append("Connected successfully: fd=%d", g_serial_fd);
     }
 }
 
 - (void)runTest:(id)sender {
+    (void)sender;
     if (_testRunning) return;
     NSInteger idx = [_testPopup indexOfSelectedItem];
     if (idx < 0 || idx >= NUM_TESTS) return;
@@ -1595,10 +1881,14 @@ static void test_diag_ease(void) {
     _runBtn.title = @"Running…";
     _runBtn.enabled = NO;
     g_stat_ok = 0; g_stat_err = 0; g_stat_sent = 0;
+    debug_log_append("Starting test: %s", all_tests[idx].name);
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
         all_tests[idx].run();
         trace_analyze();
+        debug_log_append("Test complete: %s — %lld sent, %lld ok, %lld err, score=%d (%s)",
+            all_tests[idx].name, g_stat_sent, g_stat_ok, g_stat_err,
+            (int)g_trace.analysis.h_score, g_trace.analysis.h_grade);
 
         dispatch_async(dispatch_get_main_queue(), ^{
             self.testRunning = NO;
@@ -1640,6 +1930,24 @@ static void test_diag_ease(void) {
         _statusLabel.stringValue = [NSString stringWithFormat:
             @"Recording: %u cmd, %u obs — %lld sent",
             ncmd, nobs, g_stat_sent];
+    }
+
+    // Update debug log view if new lines exist
+    uint32_t currentCount = g_debug_log.count;
+    if (currentCount != _lastDebugCount) {
+        _lastDebugCount = currentCount;
+        NSMutableString* text = [NSMutableString string];
+        pthread_mutex_lock(&g_debug_log.mutex);
+        uint32_t total = g_debug_log.head;
+        uint32_t start = (total > DEBUG_LOG_LINES) ? total - DEBUG_LOG_LINES : 0;
+        for (uint32_t i = start; i < total; i++) {
+            uint32_t idx = i % DEBUG_LOG_LINES;
+            [text appendFormat:@"%s\n", g_debug_log.lines[idx]];
+        }
+        pthread_mutex_unlock(&g_debug_log.mutex);
+        _debugTextView.string = text;
+        // Auto-scroll to bottom
+        [_debugTextView scrollRangeToVisible:NSMakeRange(text.length, 0)];
     }
 }
 
